@@ -1106,9 +1106,26 @@ def distributed_train_step(strategy, model, dist_inputs, optimizer):
         features, labels = inputs
         
         with tf.GradientTape() as tape:
-            # 모델 순전파
-            outputs = model(features, labels=labels, training=True)
-            loss = outputs["loss"]
+            # 모델 타입에 따라 다른 호출 방식 적용
+            # Wav2Vec2ForPreTraining은 labels 매개변수를 받지 않음
+            if isinstance(model, Wav2Vec2ForPreTraining):
+                outputs = model(features, training=True)
+                
+                # 컨트라스트 손실 계산
+                logits, contrastive_loss = model._compute_contrastive_loss(
+                    outputs["projected_states"],
+                    outputs["projected_quantized_features"]
+                )
+                
+                # 다양성 손실 추가
+                diversity_loss = model._compute_diversity_loss(outputs["codevector_perplexity"])
+                
+                # 최종 손실
+                loss = contrastive_loss + model.diversity_loss_weight * diversity_loss
+            else:
+                # ASR이나 분류 모델의 경우 labels 매개변수 전달
+                outputs = model(features, labels=labels, training=True)
+                loss = outputs["loss"]
         
         # 그래디언트 계산 및 적용
         gradients = tape.gradient(loss, model.trainable_variables)
