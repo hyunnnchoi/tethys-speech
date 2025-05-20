@@ -1,3 +1,4 @@
+# 2025.05.21, 정상 작동 확인
 import tensorflow as tf
 import numpy as np
 import json
@@ -1190,7 +1191,7 @@ def distributed_train_step(strategy, model, dist_inputs, optimizer):
     return strategy.reduce(tf.distribute.ReduceOp.SUM, per_replica_losses, axis=None)
 
 # wav2vec2 모델 메인 학습 함수
-def train_wav2vec2(strategy, model_type="pretraining", num_epochs=1, learning_rate=3e-5):
+def train_wav2vec2(strategy, model_type="pretraining", num_epochs=5, learning_rate=3e-5):
     """wav2vec2 모델 학습 함수"""
     with strategy.scope():
         # 모델 생성
