@@ -487,7 +487,7 @@ class WhisperModel(tf.keras.Model):
         use_cache = use_cache if use_cache is not None else self.config.use_cache
         
         # 인코더 처리 (인코더 출력이 제공되지 않은 경우)
-        if encoder_outputs is None:
+        if encoder_outputs is None and input_features is not None:
             encoder_outputs = self.encoder(
                 input_features,
                 attention_mask=attention_mask,
@@ -499,7 +499,7 @@ class WhisperModel(tf.keras.Model):
         
         # 디코더 입력이 제공되지 않은 경우 시작 토큰 생성
         if decoder_input_ids is None:
-            batch_size = tf.shape(input_features)[0]
+            batch_size = tf.shape(encoder_hidden_states)[0]
             decoder_input_ids = tf.fill((batch_size, 1), self.config.decoder_start_token_id)
         
         # 디코더 호출
@@ -553,6 +553,15 @@ class WhisperForConditionalGeneration(tf.keras.Model):
         decoder_input_ids: 디코더 입력 토큰 ID [batch_size, seq_len]
         labels: 타겟 토큰 ID [batch_size, seq_len]
         """
+        # 디코더 입력이 제공되지 않은 경우 레이블에서 생성
+        if decoder_input_ids is None and labels is not None:
+            # 레이블의 오른쪽으로 시프트하여 디코더 입력 생성 (teacher forcing)
+            decoder_input_ids = tf.pad(
+                labels[:, :-1], 
+                [[0, 0], [1, 0]], 
+                constant_values=self.config.decoder_start_token_id
+            )
+        
         # Whisper 모델 호출
         outputs = self.model(
             input_features=input_features,
@@ -782,12 +791,22 @@ def create_dummy_dataset(batch_size, n_mels=80, seq_len=3000, max_target_length=
     # 더미 특성 (멜 스펙트로그램) 생성
     dummy_features = np.random.randn(num_samples, n_mels, seq_len).astype(np.float32)
     
-    # 더미 레이블 (토큰 ID) 생성
-    dummy_labels = np.random.randint(
-        low=3,  # 특수 토큰 ID 이후부터 시작
-        high=100,  # 소규모 가상 어휘
-        size=(num_samples, max_target_length)
-    ).astype(np.int32)
+    # 더미 레이블 (토큰 ID) 생성 - 첫 번째 토큰은 BOS(1), 마지막 토큰은 EOS(2)로 설정
+    dummy_labels = np.zeros((num_samples, max_target_length), dtype=np.int32)
+    
+    # 각 시퀀스의 실제 길이 (50~90 사이의 무작위 길이)
+    sequence_lengths = np.random.randint(50, 90, size=num_samples)
+    
+    for i in range(num_samples):
+        # 첫 번째 토큰은 BOS 토큰
+        dummy_labels[i, 0] = 1  # BOS token
+        
+        # 중간 토큰은 랜덤 (3부터 100 사이의 값)
+        length = sequence_lengths[i]
+        dummy_labels[i, 1:length-1] = np.random.randint(3, 100, size=length-2)
+        
+        # 마지막 토큰은 EOS 토큰
+        dummy_labels[i, length-1] = 2  # EOS token
     
     # TensorFlow 데이터셋 생성
     dataset = tf.data.Dataset.from_tensor_slices((dummy_features, dummy_labels))
@@ -806,14 +825,21 @@ def distributed_train_step(strategy, model, dist_inputs, optimizer):
         
         with tf.GradientTape() as tape:
             # 모델 호출
-            outputs = model(features, labels=labels, training=True)
-            loss = outputs["loss"]
-        
-        # 그래디언트 계산 및 적용
-        gradients = tape.gradient(loss, model.trainable_variables)
-        optimizer.apply_gradients(zip(gradients, model.trainable_variables))
-        
-        return loss
+            try:
+                outputs = model(features, labels=labels, training=True)
+                loss = outputs["loss"]
+                
+                # 그래디언트 계산 및 적용
+                gradients = tape.gradient(loss, model.trainable_variables)
+                optimizer.apply_gradients(zip(gradients, model.trainable_variables))
+                
+                return loss
+            except Exception as e:
+                print(f"학습 스텝 실행 중 오류 발생: {e}")
+                # 형태 디버깅 출력
+                print(f"features.shape: {features.shape}")
+                print(f"labels.shape: {labels.shape}")
+                raise
     
     # 분산 전략으로 학습 스텝 실행
     per_replica_losses = strategy.run(train_step, args=(dist_inputs,))
