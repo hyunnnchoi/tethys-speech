@@ -1,0 +1,102 @@
+apiVersion: kubeflow.org/v1
+kind: "TFJob"
+metadata:
+  name: speech-whisper-sync-batch8
+spec:
+  runPolicy:
+    cleanPodPolicy: None
+  tfReplicaSpecs:
+    CHIEF:
+      replicas: 1
+      template:
+        spec:
+          containers:
+          - name: tensorflow
+            command: ["/bin/sh", "-c"]
+            env:
+            - name: ROOT_DATA_DIR
+              value: "/data"
+            args:
+              - |
+                mkdir -p /result/speech_whisper_sync_batch8;
+                echo "speech_whisper_sync_batch8" > /workspace/model.txt;
+                STARTTIME=`date "+%H:%M:%S.%N"`; echo "$STARTTIME" > /result/speech_whisper_sync_batch8/speech_whisper_sync_batch8_chief_start_time.txt;
+                top -d 0.1 -b | grep python > /result/speech_whisper_sync_batch8/speech_whisper_sync_batch8_chief_cpu.txt & python /workspace/speech_jobs/whisper_dist.py --batch_size 4 --num_batches 30  > /result/speech_whisper_sync_batch8/speech_whisper_sync_batch8_chief_log.txt 2>&1;
+                ENDTIME=`date "+%H:%M:%S.%N"`; echo "$ENDTIME" > /result/speech_whisper_sync_batch8/speech_whisper_sync_batch8_chief_end_time.txt
+            ports:
+              - containerPort: 2222
+                name: tfjob-port
+            image: your-org/speech-image:latest
+            imagePullPolicy: IfNotPresent
+            resources:
+              requests:
+                cpu: 1
+                nvidia.com/gpu: 1
+              limits:
+                cpu: 5
+                nvidia.com/gpu: 1
+            volumeMounts:
+            - mountPath: /result
+              name: result-volume
+            - mountPath: /data
+              name: dataset-volume
+            - mountPath: /dev/shm
+              name: dshm
+          volumes:
+          - name: result-volume
+            persistentVolumeClaim:
+              claimName: result-volume-claim
+          - name: dataset-volume
+            persistentVolumeClaim:
+              claimName: dataset-volume-claim
+          - name: dshm
+            emptyDir:
+              medium: Memory
+              sizeLimit: "8G"
+    WORKER:
+      replicas: 1
+      template:
+        spec:
+          containers:
+          - name: tensorflow
+            command: ["/bin/sh", "-c"]
+            env:
+            - name: ROOT_DATA_DIR
+              value: "/data"
+            args:
+              - |
+                mkdir -p /result/speech_whisper_sync_batch8;
+                echo "speech_whisper_sync_batch8" > /workspace/model.txt;
+                STARTTIME=`date "+%H:%M:%S.%N"`; echo "$STARTTIME" > /result/speech_whisper_sync_batch8/speech_whisper_sync_batch8_worker_start_time.txt;
+                top -d 0.1 -b | grep python > /result/speech_whisper_sync_batch8/speech_whisper_sync_batch8_worker_cpu.txt & python /workspace/speech_jobs/whisper_dist.py --batch_size 4 --num_batches 30 > /result/speech_whisper_sync_batch8/speech_whisper_sync_batch8_worker_log.txt 2>&1;
+                ENDTIME=`date "+%H:%M:%S.%N"`; echo "$ENDTIME" > /result/speech_whisper_sync_batch8/speech_whisper_sync_batch8_worker_end_time.txt
+            ports:
+              - containerPort: 2222
+                name: tfjob-port
+            image: your-org/speech-image:latest
+            imagePullPolicy: IfNotPresent
+            resources:
+              requests:
+                cpu: 1
+                nvidia.com/gpu: 1
+              limits:
+                cpu: 5
+                nvidia.com/gpu: 1
+            volumeMounts:
+            - mountPath: /result
+              name: result-volume
+            - mountPath: /data
+              name: dataset-volume
+            - mountPath: /dev/shm
+              name: dshm
+          volumes:
+          - name: result-volume
+            persistentVolumeClaim:
+              claimName: result-volume-claim
+          - name: dataset-volume
+            persistentVolumeClaim:
+              claimName: dataset-volume-claim
+          - name: dshm
+            emptyDir:
+              medium: Memory
+              sizeLimit: "8G"
