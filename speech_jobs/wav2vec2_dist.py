@@ -745,7 +745,8 @@ class Wav2Vec2ForPreTraining(tf.keras.Model):
     @tf.function
     def _compute_contrastive_loss(self, hidden_states, quantized_states):
         """컨트라스트 손실 계산"""
-        batch_size, sequence_length, hidden_size = tf.shape(hidden_states)[0], tf.shape(hidden_states)[1], tf.shape(hidden_states)[2]
+        batch_size = tf.shape(hidden_states)[0]
+        sequence_length = tf.shape(hidden_states)[1]
         
         # 양수 쌍 (같은 시간 위치의 인코더 출력과 양자화된 특징)
         pos_logits = tf.reduce_sum(hidden_states * quantized_states, axis=-1) / self.contrastive_logits_temperature
@@ -755,7 +756,7 @@ class Wav2Vec2ForPreTraining(tf.keras.Model):
             # 타임프레임을 섞어 부정 샘플 생성
             neg_indices = self._sample_negative_indices(sequence_length, batch_size)
             
-            # 부정 샘플 가져오기
+            # 부정 샘플 가져오기 - 안전한 tf.gather 호출
             neg_quantized = tf.gather(quantized_states, neg_indices, axis=1, batch_dims=1)
             
             # hidden_states: [batch, time, dim], neg_quantized: [batch, time, neg, dim]
@@ -788,7 +789,7 @@ class Wav2Vec2ForPreTraining(tf.keras.Model):
     @tf.function
     def _sample_negative_indices(self, sequence_length, batch_size):
         """컨트라스트 학습을 위한 부정 샘플 인덱스 생성"""
-        # TensorFlow 그래프 모드에서 반복 처리를 벡터화된 연산으로 대체
+        # TensorFlow 그래프 모드에서 완전히 호환되게 재구현
         
         # 시퀀스 길이만큼의 범위 생성: [0, 1, 2, ..., sequence_length - 1]
         all_indices = tf.range(sequence_length)
@@ -801,24 +802,41 @@ class Wav2Vec2ForPreTraining(tf.keras.Model):
         # [batch, time]
         neg_indices = tf.tile(tf.expand_dims(shuffle_indices, 0), [batch_size, 1])
         
-        # 음수 샘플 위치 조정을 위한 준비
-        # [time, batch, num_negatives] 형태로 구성
-        neg_indices_list = []
+        # 결과를 저장할 빈 텐서 생성 [batch, time, num_negatives]
+        result = tf.zeros([batch_size, sequence_length, self.num_negatives], dtype=tf.int32)
         
-        # 각 위치별로 음수 샘플 인덱스 생성 (TF 연산만 사용)
-        for i in range(sequence_length):
-            # 현재 위치에서 i+1만큼 순환 이동하고 처음 num_negatives개 선택
-            shifted = tf.roll(neg_indices, shift=i+1, axis=1)
-            neg_sample = shifted[:, :self.num_negatives]
-            neg_indices_list.append(neg_sample)
+        # tf.range를 사용하여 행렬 연산으로 변환
+        shifts = tf.range(1, sequence_length + 1)
+        time_indices = tf.range(sequence_length)
         
-        # [time, batch, num_negatives] 형태로 쌓기
-        neg_indices = tf.stack(neg_indices_list)
+        # 결과를 TensorArray에 누적
+        ta = tf.TensorArray(tf.int32, size=sequence_length, dynamic_size=False)
+        
+        # 초기 상태 설정
+        i_0 = tf.constant(0)
+        
+        # 루프 본문
+        def body(i, ta):
+            # i+1만큼 시프트
+            shift = tf.roll(neg_indices, shift=i+1, axis=1)
+            # 처음 num_negatives 선택
+            samples = shift[:, :self.num_negatives]
+            # TensorArray에 저장
+            ta = ta.write(i, samples)
+            return i + 1, ta
+        
+        # 루프 종료 조건
+        def cond(i, _):
+            return i < sequence_length
+        
+        # while_loop 실행
+        _, ta_result = tf.while_loop(cond, body, [i_0, ta])
+        
+        # TensorArray에서 텐서로 변환 [time, batch, num_negatives]
+        stacked = ta_result.stack()
         
         # [batch, time, num_negatives] 형태로 변환
-        neg_indices = tf.transpose(neg_indices, [1, 0, 2])
-        
-        return neg_indices
+        return tf.transpose(stacked, [1, 0, 2])
 
 
 # wav2vec2 음성 인식(ASR) 모델 구현
