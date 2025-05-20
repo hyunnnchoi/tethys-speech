@@ -1191,7 +1191,7 @@ def train_wav2vec2(strategy, model_type="pretraining", num_epochs=5, learning_ra
 
 
 # 메인 함수
-def main():
+def main(strategy):
     print("Wav2Vec2 분산 학습 시작...")
     
     # 네트워크 및 GPU 모니터링 시작
@@ -1232,32 +1232,32 @@ network profile started!
 
 
 if __name__ == "__main__":
-    main()
+    # 명령줄 인자 파싱
+    parser = argparse.ArgumentParser(description='wav2vec2 Distributed Speech Recognition')
+    parser.add_argument('--num_batches', type=int, default=40, help='num_batches per replica, default is set 40')
+    parser.add_argument('--batch_size', type=int, default=1, help='batch size per replica, default is set 1')
+    args = parser.parse_args()
+
+    # 환경 설정
+    tf_config = json.loads(os.environ.get('TF_CONFIG') or '{}')
+    task_config = tf_config.get('task', {})
+    task_type = task_config.get('type')
+    task_index = task_config.get('index')
+
+    # 모델과 프로세서를 저장할 로컬 디렉토리 설정
+    CACHE_DIR = '/workspace/model_cache'  # 컨테이너 내 사전 준비된 모델 캐시 경로
+    DATASET_DIR = '/workspace/datasets'  # 컨테이너 내 사전 준비된 데이터셋 경로
+
+    # 분산 학습 전략 설정
+    strategy = tf.distribute.MultiWorkerMirroredStrategy()
+
+    # 하이퍼파라미터 설정
+    BATCH_SIZE_PER_REPLICA = args.batch_size
+    GLOBAL_BATCH_SIZE = BATCH_SIZE_PER_REPLICA * strategy.num_replicas_in_sync
+    MAX_ITERATIONS = args.num_batches
+    BUFFER_SIZE = 10000
+
+    print(f'batch size per replica: {BATCH_SIZE_PER_REPLICA}, global batch size: {GLOBAL_BATCH_SIZE}')
+    print(f'num_batches: {MAX_ITERATIONS}')
     
-# 명령줄 인자 파싱
-parser = argparse.ArgumentParser(description='wav2vec2 Distributed Speech Recognition')
-parser.add_argument('--num_batches', type=int, default=40, help='num_batches per replica, default is set 40')
-parser.add_argument('--batch_size', type=int, default=1, help='batch size per replica, default is set 1')
-args = parser.parse_args()
-
-# 환경 설정
-tf_config = json.loads(os.environ.get('TF_CONFIG') or '{}')
-task_config = tf_config.get('task', {})
-task_type = task_config.get('type')
-task_index = task_config.get('index')
-
-# 모델과 프로세서를 저장할 로컬 디렉토리 설정
-CACHE_DIR = '/workspace/model_cache'  # 컨테이너 내 사전 준비된 모델 캐시 경로
-DATASET_DIR = '/workspace/datasets'  # 컨테이너 내 사전 준비된 데이터셋 경로
-
-# 분산 학습 전략 설정
-strategy = tf.distribute.MultiWorkerMirroredStrategy()
-
-# 하이퍼파라미터 설정
-BATCH_SIZE_PER_REPLICA = args.batch_size
-GLOBAL_BATCH_SIZE = BATCH_SIZE_PER_REPLICA * strategy.num_replicas_in_sync
-MAX_ITERATIONS = args.num_batches
-BUFFER_SIZE = 10000
-
-print(f'batch size per replica: {BATCH_SIZE_PER_REPLICA}, global batch size: {GLOBAL_BATCH_SIZE}')
-print(f'num_batches: {MAX_ITERATIONS}')
+    main(strategy)
