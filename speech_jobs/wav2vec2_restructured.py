@@ -490,6 +490,94 @@ class Wav2Vec2ProjectionHead(tf.keras.layers.Layer):
         hidden_states = self.dropout(hidden_states, training=training)
         return hidden_states
 
+# Wav2Vec2Quantizer 클래스 구현
+class Wav2Vec2Quantizer(tf.keras.layers.Layer):
+    def __init__(self, config):
+        super(Wav2Vec2Quantizer, self).__init__()
+        self.config = config
+        
+        # 코드북 벡터 초기화
+        self.codevectors = tf.Variable(
+            initial_value=tf.random.normal(
+                [config.num_codevector_groups, config.num_codevectors_per_group, config.codevector_dim // config.num_codevector_groups]
+            ),
+            trainable=True,
+            name="codevectors"
+        )
+        
+        # 이 벡터는 contrastive loss에서 사용될 negative samples 관리에 필요
+        self.neg_sample_indices = None
+    
+    def call(self, hidden_states, training=False):
+        batch_size, sequence_length, hidden_size = tf.shape(hidden_states)[0], tf.shape(hidden_states)[1], tf.shape(hidden_states)[2]
+        
+        # hidden_states를 그룹 수에 맞게 재구성
+        hidden_states = tf.reshape(
+            hidden_states, 
+            [batch_size, sequence_length, self.config.num_codevector_groups, hidden_size // self.config.num_codevector_groups]
+        )
+        
+        # 각 그룹별로 코드벡터와의 거리 계산
+        distances = []
+        for i in range(self.config.num_codevector_groups):
+            group_hidden = hidden_states[:, :, i, :]  # [batch, time, dim]
+            
+            # hidden_states를 [batch*time, dim] 형태로 변환
+            reshaped_hidden = tf.reshape(group_hidden, [-1, tf.shape(group_hidden)[-1]])  # [batch*time, dim]
+            
+            # 현재 그룹의 코드벡터들 [num_vectors, dim]
+            group_vectors = self.codevectors[i]  # [num_vectors, dim]
+            
+            # 각 hidden state와 모든 코드벡터 사이의 유클리드 거리 계산
+            expanded_hidden = tf.expand_dims(reshaped_hidden, 1)  # [batch*time, 1, dim]
+            expanded_vectors = tf.expand_dims(group_vectors, 0)   # [1, num_vectors, dim]
+            
+            # 거리 계산: [batch*time, num_vectors]
+            dist = tf.reduce_sum(tf.square(expanded_hidden - expanded_vectors), axis=-1)
+            
+            # 원래 배치, 시간 차원으로 복원: [batch, time, num_vectors]
+            dist = tf.reshape(dist, [batch_size, sequence_length, -1])
+            distances.append(dist)
+        
+        # 모든 그룹의 거리: [num_groups, batch, time, num_vectors]
+        distances = tf.stack(distances, axis=0)
+        
+        # 가장 가까운 코드벡터 선택 (Hard Quantization)
+        indices = tf.argmin(distances, axis=-1)  # [num_groups, batch, time]
+        
+        # one-hot 인코딩으로 변환
+        encodings = tf.one_hot(indices, self.config.num_codevectors_per_group)  # [num_groups, batch, time, num_vectors]
+        
+        # 가장 가까운 코드벡터 가져오기
+        quantized_features = []
+        for i in range(self.config.num_codevector_groups):
+            # 인코딩을 사용하여 코드벡터 선택
+            encoding = encodings[i]  # [batch, time, num_vectors]
+            
+            # 코드벡터와 내적 계산
+            # [batch, time, num_vectors] @ [num_vectors, dim] -> [batch, time, dim]
+            quantized = tf.matmul(encoding, self.codevectors[i])
+            quantized_features.append(quantized)
+        
+        # 그룹별 양자화 결과 결합
+        # [batch, time, num_groups, dim]
+        quantized_features = tf.stack(quantized_features, axis=2)
+        
+        # 원래 모양으로 재구성
+        # [batch, time, hidden_size]
+        quantized_features = tf.reshape(quantized_features, [batch_size, sequence_length, -1])
+        
+        # 다양성 계산 (코드북 활용도)
+        avg_probs = tf.reduce_mean(encodings, axis=[1, 2])  # [num_groups, num_vectors]
+        perplexity = tf.exp(-tf.reduce_sum(avg_probs * tf.math.log(avg_probs + 1e-10), axis=-1))  # [num_groups]
+        perplexity = tf.reduce_mean(perplexity)  # 스칼라
+        
+        return {
+            "quantized_features": quantized_features,
+            "encodings": encodings,
+            "distances": distances,
+            "codevector_perplexity": perplexity
+        }
 
 # ============ 주요 모델 클래스 ============ #
 
@@ -510,8 +598,8 @@ class Wav2Vec2Model(tf.keras.Model):
         
         # 양자화기 (pre-training에서 사용)
         # 실제 구현은 생략되었지만 실제 사용 시 구현 필요
-        self.quantizer = None
-        
+        self.quantizer = Wav2Vec2Quantizer(config)
+                
         # 투영 헤드
         self.project_hid = Wav2Vec2ProjectionHead(config)
         self.project_q = Wav2Vec2ProjectionHead(config)
@@ -573,7 +661,7 @@ class Wav2Vec2Model(tf.keras.Model):
             result["attentions"] = encoder_outputs["attentions"]
         
         return result
-        
+
 # 사전학습 wav2vec2 모델 구현
 class Wav2Vec2ForPreTraining(tf.keras.Model):
     def __init__(self, config):
@@ -1011,7 +1099,7 @@ def create_full_model(model_type="pretraining",
 
 # 분산 학습 스텝 정의
 @tf.function
-def distributed_train_step(model, dist_inputs, optimizer):
+def distributed_train_step(strategy, model, dist_inputs, optimizer):
     """분산 학습을 위한 스텝 함수"""
     
     def train_step(inputs):
@@ -1033,7 +1121,6 @@ def distributed_train_step(model, dist_inputs, optimizer):
     
     # 손실 값 집계
     return strategy.reduce(tf.distribute.ReduceOp.SUM, per_replica_losses, axis=None)
-
 
 # wav2vec2 모델 메인 학습 함수
 def train_wav2vec2(strategy, model_type="pretraining", num_epochs=5, learning_rate=3e-5):
@@ -1088,8 +1175,8 @@ def train_wav2vec2(strategy, model_type="pretraining", num_epochs=5, learning_ra
                 iterator = iter(dist_dataset)
                 inputs = next(iterator)
             
-            # 분산 학습 스텝 실행
-            loss = distributed_train_step(model, inputs, optimizer)
+            # 분산 학습 스텝 실행 (strategy 명시적 전달)
+            loss = distributed_train_step(strategy, model, inputs, optimizer)
             
             # 로깅
             if step % 10 == 0:
@@ -1176,6 +1263,3 @@ print(f'batch size per replica: {BATCH_SIZE_PER_REPLICA}, global batch size: {GL
 print(f'num_batches: {MAX_ITERATIONS}')
 
 
-# ============ 모델 설정 및 기본 함수 ============ #
-
-# wav2vec2 모델 설정값
