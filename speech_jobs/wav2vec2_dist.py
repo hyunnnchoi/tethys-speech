@@ -199,7 +199,7 @@ class Wav2Vec2FeatureExtractor(tf.keras.layers.Layer):
         
         # 위치 인코딩 레이어
         self.pos_conv_embed = tf.keras.layers.Conv1D(
-            filters=config.hidden_size,
+            filters=config.conv_dim[-1],
             kernel_size=config.num_conv_pos_embeddings,
             padding="same",
             groups=config.num_conv_pos_embedding_groups,
@@ -624,7 +624,8 @@ class Wav2Vec2Model(tf.keras.Model):
             quantized_features = None
             codevector_perplexity = None
         
-        # 3. 특징 투영
+        # 3. 특징 투영 - hidden_size 차원으로 투영
+        # 특징 추출기의 출력 차원(conv_dim[-1])과 인코더의 입력 차원(hidden_size)를 맞추기 위한 투영
         hidden_states = self.feature_projection(extract_features)
         hidden_states = self.feature_projection_layer_norm(hidden_states)
         hidden_states = self.feature_projection_dropout(hidden_states, training=training)
