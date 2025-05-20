@@ -1,4 +1,3 @@
-# 2025.05.21, 정상 작동 확인
 import tensorflow as tf
 import numpy as np
 import json
@@ -1191,7 +1190,7 @@ def distributed_train_step(strategy, model, dist_inputs, optimizer):
     return strategy.reduce(tf.distribute.ReduceOp.SUM, per_replica_losses, axis=None)
 
 # wav2vec2 모델 메인 학습 함수
-def train_wav2vec2(strategy, model_type="pretraining", num_epochs=5, learning_rate=3e-5):
+def train_wav2vec2(strategy, model_type="pretraining", num_epochs=1, learning_rate=3e-5):
     """wav2vec2 모델 학습 함수"""
     with strategy.scope():
         # 모델 생성
@@ -1232,6 +1231,9 @@ def train_wav2vec2(strategy, model_type="pretraining", num_epochs=5, learning_ra
     step = 0
     iterator = iter(dist_dataset)
     
+    # 시작 시간 기록
+    start_time = time.time()
+    
     for epoch in range(num_epochs):
         print(f"Epoch {epoch+1}/{num_epochs}")
         
@@ -1243,12 +1245,19 @@ def train_wav2vec2(strategy, model_type="pretraining", num_epochs=5, learning_ra
                 iterator = iter(dist_dataset)
                 inputs = next(iterator)
             
+            # 현재 시간 기록
+            step_start = time.time()
+            
             # 분산 학습 스텝 실행 (strategy 명시적 전달)
             loss = distributed_train_step(strategy, model, inputs, optimizer)
             
-            # 로깅
-            if step % 10 == 0:
-                print(f"Step {step}, Loss: {loss.numpy():.4f}")
+            # 스텝 완료 시간
+            step_end = time.time()
+            step_duration = step_end - step_start
+            elapsed = step_end - start_time
+            
+            # 모든 스텝에 대해 타임스탬프와 함께 로깅
+            print(f"Step {step}, Loss: {loss.numpy():.4f}, Time: {time.strftime('%H:%M:%S')} (경과: {elapsed:.2f}초, 스텝 시간: {step_duration:.2f}초)")
             
             step += 1
         
