@@ -599,7 +599,7 @@ class Wav2Vec2Model(tf.keras.Model):
         # 양자화기 (pre-training에서 사용)
         # 실제 구현은 생략되었지만 실제 사용 시 구현 필요
         self.quantizer = Wav2Vec2Quantizer(config)
-                
+
         # 투영 헤드
         self.project_hid = Wav2Vec2ProjectionHead(config)
         self.project_q = Wav2Vec2ProjectionHead(config)
@@ -1261,5 +1261,3 @@ BUFFER_SIZE = 10000
 
 print(f'batch size per replica: {BATCH_SIZE_PER_REPLICA}, global batch size: {GLOBAL_BATCH_SIZE}')
 print(f'num_batches: {MAX_ITERATIONS}')
-
-
