@@ -1,3 +1,579 @@
+import tensorflow as tf
+import numpy as np
+import json
+import os
+import sys
+import time
+import argparse
+
+
+class Wav2Vec2Config:
+    def __init__(self):
+        # 특징 추출기 설정
+        self.feat_extract_norm = "group"
+        self.feat_extract_activation = "gelu"
+        self.conv_dim = [512, 512, 512, 512, 512, 512, 512]
+        self.conv_stride = [5, 2, 2, 2, 2, 2, 2]
+        self.conv_kernel = [10, 3, 3, 3, 3, 2, 2]
+        self.conv_bias = False
+        self.num_conv_pos_embeddings = 128
+        self.num_conv_pos_embedding_groups = 16
+        
+        # 모델 차원 및 인코더 설정
+        self.hidden_size = 768
+        self.num_hidden_layers = 12
+        self.num_attention_heads = 12
+        self.intermediate_size = 3072
+        self.hidden_act = "gelu"
+        self.hidden_dropout = 0.1
+        self.activation_dropout = 0.1
+        self.attention_dropout = 0.1
+        self.layer_norm_eps = 1e-5
+        
+        # 양자화 및 마스킹 설정
+        self.num_codevectors_per_group = 320
+        self.num_codevector_groups = 2
+        self.contrastive_logits_temperature = 0.1
+        self.num_negatives = 100
+        self.codevector_dim = 256
+        self.proj_codevector_dim = 256
+        self.diversity_loss_weight = 0.1
+        self.ctc_loss_reduction = "sum"
+        self.ctc_zero_infinity = False
+        
+        # 미세 조정 설정
+        self.mask_time_prob = 0.05
+        self.mask_time_length = 10
+        self.mask_feature_prob = 0.0
+        self.mask_feature_length = 10
+        
+        # 추가 설정
+        self.vocab_size = 32
+        self.do_stable_layer_norm = True
+        self.use_weighted_layer_sum = False
+        self.classifier_proj_size = 256
+        self.tdnn_dim = [512, 512, 512, 512, 1500]
+        self.tdnn_kernel = [5, 3, 3, 1, 1]
+        self.tdnn_dilation = [1, 2, 3, 1, 1]
+        self.xvector_output_dim = 512
+
+
+# Gelu 활성화 함수 정의
+def gelu(x):
+    """
+    Gaussian Error Linear Unit 활성화 함수
+    """
+    return 0.5 * x * (1.0 + tf.math.erf(x / tf.math.sqrt(2.0)))
+
+
+# 그룹 정규화 레이어
+class GroupNormalization(tf.keras.layers.Layer):
+    def __init__(self, groups=32, axis=-1, epsilon=1e-5):
+        super(GroupNormalization, self).__init__()
+        self.groups = groups
+        self.axis = axis
+        self.epsilon = epsilon
+    
+    def build(self, input_shape):
+        dim = input_shape[self.axis]
+        if dim is None:
+            raise ValueError('Dimension of axis {} must be known'.format(self.axis))
+        if dim % self.groups != 0:
+            raise ValueError('Dimension of axis {} must be divisible by groups {}'.format(
+                self.axis, self.groups))
+        
+        self.gamma = self.add_weight(
+            name='gamma',
+            shape=(dim,),
+            initializer='ones',
+            trainable=True)
+        
+        self.beta = self.add_weight(
+            name='beta',
+            shape=(dim,),
+            initializer='zeros',
+            trainable=True)
+    
+    def call(self, inputs):
+        input_shape = tf.shape(inputs)
+        reshaped_inputs = self._reshape_into_groups(inputs)
+        
+        normalized_inputs = self._apply_normalization(reshaped_inputs, input_shape)
+        
+        return tf.reshape(normalized_inputs, input_shape)
+    
+    def _reshape_into_groups(self, inputs):
+        input_shape = tf.shape(inputs)
+        group_shape = [input_shape[0], input_shape[1], self.groups, input_shape[2] // self.groups]
+        
+        # [batch, time, features] -> [batch, time, groups, features_per_group]
+        group_shaped_inputs = tf.reshape(inputs, group_shape)
+        
+        # [batch, time, groups, features_per_group] -> [batch, time, features_per_group, groups]
+        return tf.transpose(group_shaped_inputs, [0, 1, 3, 2])
+    
+    def _apply_normalization(self, reshaped_inputs, input_shape):
+        # 평균과 분산 계산
+        mean, variance = tf.nn.moments(reshaped_inputs, [1, 2], keepdims=True)
+        # 정규화
+        normalized_inputs = (reshaped_inputs - mean) / tf.sqrt(variance + self.epsilon)
+        
+        # 원래 형태로 복원
+        normalized_inputs = tf.transpose(normalized_inputs, [0, 1, 3, 2])
+        normalized_inputs = tf.reshape(normalized_inputs, input_shape)
+        
+        # 스케일 및 시프트 적용
+        return self.gamma * normalized_inputs + self.beta
+
+
+# 상대적 위치 임베딩 레이어
+class RelativePositionalEncoding(tf.keras.layers.Layer):
+    def __init__(self, dim, max_length=5000):
+        super(RelativePositionalEncoding, self).__init__()
+        self.dim = dim
+        pe = self._get_pos_encoding(max_length, dim)
+        self.pos_embedding = tf.Variable(
+            initial_value=pe,
+            trainable=True,
+            dtype=tf.float32,
+            name="pos_embedding"
+        )
+    
+    def _get_pos_encoding(self, max_length, d_model):
+        # 위치 임베딩 초기화
+        pos_enc = np.zeros((max_length, d_model))
+        for pos in range(max_length):
+            for i in range(0, d_model, 2):
+                pos_enc[pos, i] = np.sin(pos / (10000 ** (i / d_model)))
+                if i + 1 < d_model:
+                    pos_enc[pos, i + 1] = np.cos(pos / (10000 ** (i / d_model)))
+        return pos_enc
+    
+    def call(self, length):
+        return self.pos_embedding[:length]
+
+
+# ============ 기본 모델 컴포넌트 ============ #
+
+# 특징 추출기 (Feature Extractor) 구현
+class Wav2Vec2FeatureExtractor(tf.keras.layers.Layer):
+    def __init__(self, config):
+        super(Wav2Vec2FeatureExtractor, self).__init__()
+        self.config = config
+        
+        # 컨볼루션 레이어 스택 생성
+        self.conv_layers = []
+        
+        # 첫 번째 컨볼루션 레이어
+        self.conv_layers.append(
+            tf.keras.Sequential([
+                tf.keras.layers.Conv1D(
+                    filters=config.conv_dim[0],
+                    kernel_size=config.conv_kernel[0],
+                    strides=config.conv_stride[0],
+                    padding="same",
+                    use_bias=config.conv_bias,
+                    name="conv_0"
+                ),
+                GroupNormalization(groups=self.config.num_conv_pos_embedding_groups) if config.feat_extract_norm == "group" else tf.keras.layers.LayerNormalization(epsilon=1e-5),
+                tf.keras.layers.Activation(gelu if config.feat_extract_activation == "gelu" else "relu")
+            ])
+        )
+        
+        # 나머지 컨볼루션 레이어 추가
+        for i in range(1, len(config.conv_dim)):
+            self.conv_layers.append(
+                tf.keras.Sequential([
+                    tf.keras.layers.Conv1D(
+                        filters=config.conv_dim[i],
+                        kernel_size=config.conv_kernel[i],
+                        strides=config.conv_stride[i],
+                        padding="same",
+                        use_bias=config.conv_bias,
+                        name=f"conv_{i}"
+                    ),
+                    GroupNormalization(groups=self.config.num_conv_pos_embedding_groups) if config.feat_extract_norm == "group" else tf.keras.layers.LayerNormalization(epsilon=1e-5),
+                    tf.keras.layers.Activation(gelu if config.feat_extract_activation == "gelu" else "relu")
+                ])
+            )
+        
+        # 위치 인코딩 레이어
+        self.pos_conv_embed = tf.keras.layers.Conv1D(
+            filters=config.hidden_size,
+            kernel_size=config.num_conv_pos_embeddings,
+            padding="same",
+            groups=config.num_conv_pos_embedding_groups,
+            name="pos_conv_embed"
+        )
+        
+        # 레이어 정규화
+        self.layer_norm = tf.keras.layers.LayerNormalization(epsilon=config.layer_norm_eps)
+        self.dropout = tf.keras.layers.Dropout(config.hidden_dropout)
+    
+    def call(self, inputs, training=False):
+        hidden_states = tf.expand_dims(inputs, axis=-1)  # [batch, time] -> [batch, time, 1]
+        
+        # 컨볼루션 레이어 통과
+        for conv_layer in self.conv_layers:
+            hidden_states = conv_layer(hidden_states, training=training)
+        
+        # 위치 인코딩 추가
+        position_embeddings = self.pos_conv_embed(hidden_states)
+        
+        # 합산 및 정규화
+        hidden_states = hidden_states + position_embeddings
+        hidden_states = self.layer_norm(hidden_states)
+        hidden_states = self.dropout(hidden_states, training=training)
+        
+        return hidden_states
+
+
+# MultiHeadAttention 구현
+class Wav2Vec2MultiHeadAttention(tf.keras.layers.Layer):
+    def __init__(self, config):
+        super(Wav2Vec2MultiHeadAttention, self).__init__()
+        self.config = config
+        self.embed_dim = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.head_dim = self.embed_dim // self.num_heads
+        
+        if self.head_dim * self.num_heads != self.embed_dim:
+            raise ValueError(
+                f"embed_dim must be divisible by num_heads (got `embed_dim`: {self.embed_dim} and `num_heads`: {self.num_heads})."
+            )
+        
+        # 어텐션 프로젝션 레이어
+        self.q_proj = tf.keras.layers.Dense(self.embed_dim, use_bias=True, name="q_proj")
+        self.k_proj = tf.keras.layers.Dense(self.embed_dim, use_bias=True, name="k_proj")
+        self.v_proj = tf.keras.layers.Dense(self.embed_dim, use_bias=True, name="v_proj")
+        self.out_proj = tf.keras.layers.Dense(self.embed_dim, use_bias=True, name="out_proj")
+        
+        self.dropout = tf.keras.layers.Dropout(config.attention_dropout)
+    
+    def _reshape_for_multihead_attention(self, x):
+        batch_size = tf.shape(x)[0]
+        seq_length = tf.shape(x)[1]
+        
+        # [batch, time, embed_dim] -> [batch, time, num_heads, head_dim]
+        reshaped = tf.reshape(x, (batch_size, seq_length, self.num_heads, self.head_dim))
+        
+        # [batch, time, num_heads, head_dim] -> [batch, num_heads, time, head_dim]
+        return tf.transpose(reshaped, perm=[0, 2, 1, 3])
+    
+    def call(self, hidden_states, attention_mask=None, output_attentions=False, training=False):
+        batch_size = tf.shape(hidden_states)[0]
+        seq_length = tf.shape(hidden_states)[1]
+        
+        # 선형 투영
+        query_states = self.q_proj(hidden_states)  # [batch, time, embed_dim]
+        key_states = self.k_proj(hidden_states)    # [batch, time, embed_dim]
+        value_states = self.v_proj(hidden_states)  # [batch, time, embed_dim]
+        
+        # 다중 헤드 형태로 변환
+        query_states = self._reshape_for_multihead_attention(query_states)  # [batch, num_heads, time, head_dim]
+        key_states = self._reshape_for_multihead_attention(key_states)      # [batch, num_heads, time, head_dim]
+        value_states = self._reshape_for_multihead_attention(value_states)  # [batch, num_heads, time, head_dim]
+        
+        # QK^T 계산
+        attention_scores = tf.matmul(query_states, key_states, transpose_b=True)  # [batch, num_heads, time, time]
+        attention_scores = attention_scores / tf.math.sqrt(tf.cast(self.head_dim, tf.float32))
+        
+        # 어텐션 마스크 적용 (필요한 경우)
+        if attention_mask is not None:
+            # 마스크를 [batch, 1, 1, time] 형태로 변환하여 브로드캐스팅 활용
+            attention_mask = tf.expand_dims(tf.expand_dims(attention_mask, 1), 1)
+            attention_scores = attention_scores + (1.0 - attention_mask) * -10000.0
+        
+        # 소프트맥스 적용
+        attention_probs = tf.nn.softmax(attention_scores, axis=-1)
+        attention_probs = self.dropout(attention_probs, training=training)
+        
+        # 값과 어텐션 가중치 결합
+        context_states = tf.matmul(attention_probs, value_states)  # [batch, num_heads, time, head_dim]
+        
+        # 형태 변환: [batch, num_heads, time, head_dim] -> [batch, time, num_heads, head_dim]
+        context_states = tf.transpose(context_states, perm=[0, 2, 1, 3])
+        
+        # 최종 형태로 변환: [batch, time, embed_dim]
+        context_states = tf.reshape(context_states, (batch_size, seq_length, self.embed_dim))
+        
+        # 최종 프로젝션
+        output = self.out_proj(context_states)
+        
+        # 어텐션 가중치 반환 (필요한 경우)
+        outputs = (output, attention_probs) if output_attentions else (output,)
+        
+        return outputs
+
+
+# FeedForward 네트워크 구현
+class Wav2Vec2FeedForward(tf.keras.layers.Layer):
+    def __init__(self, config):
+        super(Wav2Vec2FeedForward, self).__init__()
+        self.intermediate_dense = tf.keras.layers.Dense(config.intermediate_size, name="intermediate_dense")
+        self.intermediate_act_fn = gelu if config.hidden_act == "gelu" else tf.keras.activations.get(config.hidden_act)
+        self.intermediate_dropout = tf.keras.layers.Dropout(config.activation_dropout)
+        
+        self.output_dense = tf.keras.layers.Dense(config.hidden_size, name="output_dense")
+        self.output_dropout = tf.keras.layers.Dropout(config.hidden_dropout)
+    
+    def call(self, hidden_states, training=False):
+        hidden_states = self.intermediate_dense(hidden_states)
+        hidden_states = self.intermediate_act_fn(hidden_states)
+        hidden_states = self.intermediate_dropout(hidden_states, training=training)
+        
+        hidden_states = self.output_dense(hidden_states)
+        hidden_states = self.output_dropout(hidden_states, training=training)
+        
+        return hidden_states
+
+
+# Transformer 인코더 레이어 구현
+class Wav2Vec2EncoderLayer(tf.keras.layers.Layer):
+    def __init__(self, config):
+        super(Wav2Vec2EncoderLayer, self).__init__()
+        self.config = config
+        self.do_stable_layer_norm = config.do_stable_layer_norm
+        
+        # 어텐션 레이어
+        self.attention = Wav2Vec2MultiHeadAttention(config)
+        self.attention_dropout = tf.keras.layers.Dropout(config.hidden_dropout)
+        self.attention_layer_norm = tf.keras.layers.LayerNormalization(epsilon=config.layer_norm_eps)
+        
+        # 피드포워드 레이어
+        self.feed_forward = Wav2Vec2FeedForward(config)
+        self.feed_forward_layer_norm = tf.keras.layers.LayerNormalization(epsilon=config.layer_norm_eps)
+    
+    def call(self, hidden_states, attention_mask=None, output_attentions=False, training=False):
+        # self-attention 레이어
+        if self.do_stable_layer_norm:
+            # 레이어 정규화 후 어텐션
+            attention_input = self.attention_layer_norm(hidden_states)
+            attention_outputs = self.attention(
+                attention_input,
+                attention_mask=attention_mask,
+                output_attentions=output_attentions,
+                training=training
+            )
+            attention_output = attention_outputs[0]
+            
+            # 잔차 연결
+            attention_output = self.attention_dropout(attention_output, training=training)
+            hidden_states = hidden_states + attention_output
+            
+            # 레이어 정규화 후 피드포워드
+            feed_forward_input = self.feed_forward_layer_norm(hidden_states)
+            feed_forward_output = self.feed_forward(feed_forward_input, training=training)
+            
+            # 잔차 연결
+            hidden_states = hidden_states + feed_forward_output
+        else:
+            # 기존 방식: 어텐션 후 레이어 정규화
+            attention_outputs = self.attention(
+                hidden_states,
+                attention_mask=attention_mask,
+                output_attentions=output_attentions,
+                training=training
+            )
+            attention_output = attention_outputs[0]
+            
+            # 잔차 연결 및 레이어 정규화
+            attention_output = self.attention_dropout(attention_output, training=training)
+            hidden_states = self.attention_layer_norm(hidden_states + attention_output)
+            
+            # 피드포워드 및 정규화
+            feed_forward_output = self.feed_forward(hidden_states, training=training)
+            hidden_states = self.feed_forward_layer_norm(hidden_states + feed_forward_output)
+        
+        outputs = (hidden_states,) + attention_outputs[1:] if output_attentions else (hidden_states,)
+        
+        return outputs
+
+
+# Transformer 인코더 구현
+class Wav2Vec2Encoder(tf.keras.layers.Layer):
+    def __init__(self, config):
+        super(Wav2Vec2Encoder, self).__init__()
+        self.config = config
+        self.layers = [Wav2Vec2EncoderLayer(config) for _ in range(config.num_hidden_layers)]
+        self.gradient_checkpointing = False
+        
+        # 가중치 합계를 위한 레이어 (필요한 경우)
+        self.layer_weights = None
+        if config.use_weighted_layer_sum:
+            self.layer_weights = tf.Variable(
+                initial_value=tf.ones(config.num_hidden_layers) / config.num_hidden_layers,
+                trainable=True,
+                dtype=tf.float32,
+                name="layer_weights"
+            )
+    
+    def call(self, 
+             hidden_states, 
+             attention_mask=None,
+             output_hidden_states=False, 
+             output_attentions=False, 
+             return_dict=True,
+             training=False):
+        all_hidden_states = () if output_hidden_states else None
+        all_attentions = () if output_attentions else None
+        
+        if self.config.use_weighted_layer_sum:
+            # 0번째 레이어 출력을 초기값으로 사용
+            layerwise_hidden_states = ()
+            for i, layer in enumerate(self.layers):
+                if output_hidden_states:
+                    all_hidden_states = all_hidden_states + (hidden_states,)
+                
+                # 정규화된 가중치 계산
+                layer_outputs = layer(
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    output_attentions=output_attentions,
+                    training=training
+                )
+                hidden_states = layer_outputs[0]
+                
+                layerwise_hidden_states = layerwise_hidden_states + (hidden_states,)
+                
+                if output_attentions:
+                    all_attentions = all_attentions + (layer_outputs[1],)
+            
+            # 가중치 정규화
+            norm_weights = tf.nn.softmax(self.layer_weights, axis=-1)
+            
+            # 정규화된 가중치로 각 레이어의 출력 가중합 계산
+            hidden_states = tf.stack(layerwise_hidden_states, axis=0)  # [num_layers, batch, time, hidden_size]
+            hidden_states = tf.einsum("l,lbth->bth", norm_weights, hidden_states)
+        else:
+            # 기본 구현: 각 레이어 순차적으로 통과
+            for i, layer in enumerate(self.layers):
+                if output_hidden_states:
+                    all_hidden_states = all_hidden_states + (hidden_states,)
+                
+                layer_outputs = layer(
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    output_attentions=output_attentions,
+                    training=training
+                )
+                hidden_states = layer_outputs[0]
+                
+                if output_attentions:
+                    all_attentions = all_attentions + (layer_outputs[1],)
+        
+        # 마지막 레이어 출력도 추가
+        if output_hidden_states:
+            all_hidden_states = all_hidden_states + (hidden_states,)
+        
+        if not return_dict:
+            return tuple(v for v in [hidden_states, all_hidden_states, all_attentions] if v is not None)
+        
+        return {
+            "last_hidden_state": hidden_states,
+            "hidden_states": all_hidden_states,
+            "attentions": all_attentions
+        }
+
+
+# 프로젝션 헤드 구현
+class Wav2Vec2ProjectionHead(tf.keras.layers.Layer):
+    def __init__(self, config):
+        super(Wav2Vec2ProjectionHead, self).__init__()
+        self.dense = tf.keras.layers.Dense(config.proj_codevector_dim, name="projection_head")
+        self.layer_norm = tf.keras.layers.LayerNormalization(epsilon=config.layer_norm_eps)
+        self.dropout = tf.keras.layers.Dropout(config.hidden_dropout)
+    
+    def call(self, hidden_states, training=False):
+        hidden_states = self.dense(hidden_states)
+        hidden_states = self.layer_norm(hidden_states)
+        hidden_states = self.dropout(hidden_states, training=training)
+        return hidden_states
+
+
+# ============ 주요 모델 클래스 ============ #
+
+# 메인 wav2vec2 모델 구현
+class Wav2Vec2Model(tf.keras.Model):
+    def __init__(self, config):
+        super(Wav2Vec2Model, self).__init__()
+        self.config = config
+        
+        # 특징 추출기 및 투영
+        self.feature_extractor = Wav2Vec2FeatureExtractor(config)
+        self.feature_projection = tf.keras.layers.Dense(config.hidden_size, name="feature_projection")
+        self.feature_projection_layer_norm = tf.keras.layers.LayerNormalization(epsilon=config.layer_norm_eps)
+        self.feature_projection_dropout = tf.keras.layers.Dropout(config.hidden_dropout)
+        
+        # 인코더
+        self.encoder = Wav2Vec2Encoder(config)
+        
+        # 양자화기 (pre-training에서 사용)
+        # 실제 구현은 생략되었지만 실제 사용 시 구현 필요
+        self.quantizer = None
+        
+        # 투영 헤드
+        self.project_hid = Wav2Vec2ProjectionHead(config)
+        self.project_q = Wav2Vec2ProjectionHead(config)
+    
+    def call(self, inputs, attention_mask=None, 
+             output_attentions=False, output_hidden_states=False,
+             return_dict=True, training=False):
+        
+        # 1. 특징 추출
+        extract_features = self.feature_extractor(inputs, training=training)
+        
+        # 2. 타겟 양자화를 위한 특징 제공
+        if training:
+            # 양자화 대상 특징
+            quantize_targets = extract_features
+            
+            # 양자화
+            quantized_result = self.quantizer(quantize_targets, training=True)
+            quantized_features = quantized_result["quantized_features"]
+            codevector_perplexity = quantized_result["codevector_perplexity"]
+        else:
+            quantized_features = None
+            codevector_perplexity = None
+        
+        # 3. 특징 투영
+        hidden_states = self.feature_projection(extract_features)
+        hidden_states = self.feature_projection_layer_norm(hidden_states)
+        hidden_states = self.feature_projection_dropout(hidden_states, training=training)
+        
+        # 4. 인코더에 전달
+        encoder_outputs = self.encoder(
+            hidden_states,
+            attention_mask=attention_mask,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            training=training
+        )
+        
+        if not return_dict:
+            return encoder_outputs
+        
+        # 반환값 준비
+        result = {
+            "last_hidden_state": encoder_outputs["last_hidden_state"],
+            "extract_features": extract_features
+        }
+        
+        if quantized_features is not None:
+            result["quantized_features"] = quantized_features
+        
+        if codevector_perplexity is not None:
+            result["codevector_perplexity"] = codevector_perplexity
+        
+        if output_hidden_states:
+            result["hidden_states"] = encoder_outputs["hidden_states"]
+        
+        if output_attentions:
+            result["attentions"] = encoder_outputs["attentions"]
+        
+        return result
+        
 # 사전학습 wav2vec2 모델 구현
 class Wav2Vec2ForPreTraining(tf.keras.Model):
     def __init__(self, config):
@@ -569,14 +1145,8 @@ network profile started!
 
 
 if __name__ == "__main__":
-    main()import tensorflow as tf
-import numpy as np
-import json
-import os
-import sys
-import time
-import argparse
-
+    main()
+    
 # 명령줄 인자 파싱
 parser = argparse.ArgumentParser(description='wav2vec2 Distributed Speech Recognition')
 parser.add_argument('--num_batches', type=int, default=40, help='num_batches per replica, default is set 40')
@@ -609,569 +1179,3 @@ print(f'num_batches: {MAX_ITERATIONS}')
 # ============ 모델 설정 및 기본 함수 ============ #
 
 # wav2vec2 모델 설정값
-class Wav2Vec2Config:
-    def __init__(self):
-        # 특징 추출기 설정
-        self.feat_extract_norm = "group"
-        self.feat_extract_activation = "gelu"
-        self.conv_dim = [512, 512, 512, 512, 512, 512, 512]
-        self.conv_stride = [5, 2, 2, 2, 2, 2, 2]
-        self.conv_kernel = [10, 3, 3, 3, 3, 2, 2]
-        self.conv_bias = False
-        self.num_conv_pos_embeddings = 128
-        self.num_conv_pos_embedding_groups = 16
-        
-        # 모델 차원 및 인코더 설정
-        self.hidden_size = 768
-        self.num_hidden_layers = 12
-        self.num_attention_heads = 12
-        self.intermediate_size = 3072
-        self.hidden_act = "gelu"
-        self.hidden_dropout = 0.1
-        self.activation_dropout = 0.1
-        self.attention_dropout = 0.1
-        self.layer_norm_eps = 1e-5
-        
-        # 양자화 및 마스킹 설정
-        self.num_codevectors_per_group = 320
-        self.num_codevector_groups = 2
-        self.contrastive_logits_temperature = 0.1
-        self.num_negatives = 100
-        self.codevector_dim = 256
-        self.proj_codevector_dim = 256
-        self.diversity_loss_weight = 0.1
-        self.ctc_loss_reduction = "sum"
-        self.ctc_zero_infinity = False
-        
-        # 미세 조정 설정
-        self.mask_time_prob = 0.05
-        self.mask_time_length = 10
-        self.mask_feature_prob = 0.0
-        self.mask_feature_length = 10
-        
-        # 추가 설정
-        self.vocab_size = 32
-        self.do_stable_layer_norm = True
-        self.use_weighted_layer_sum = False
-        self.classifier_proj_size = 256
-        self.tdnn_dim = [512, 512, 512, 512, 1500]
-        self.tdnn_kernel = [5, 3, 3, 1, 1]
-        self.tdnn_dilation = [1, 2, 3, 1, 1]
-        self.xvector_output_dim = 512
-
-
-# Gelu 활성화 함수 정의
-def gelu(x):
-    """
-    Gaussian Error Linear Unit 활성화 함수
-    """
-    return 0.5 * x * (1.0 + tf.math.erf(x / tf.math.sqrt(2.0)))
-
-
-# 그룹 정규화 레이어
-class GroupNormalization(tf.keras.layers.Layer):
-    def __init__(self, groups=32, axis=-1, epsilon=1e-5):
-        super(GroupNormalization, self).__init__()
-        self.groups = groups
-        self.axis = axis
-        self.epsilon = epsilon
-    
-    def build(self, input_shape):
-        dim = input_shape[self.axis]
-        if dim is None:
-            raise ValueError('Dimension of axis {} must be known'.format(self.axis))
-        if dim % self.groups != 0:
-            raise ValueError('Dimension of axis {} must be divisible by groups {}'.format(
-                self.axis, self.groups))
-        
-        self.gamma = self.add_weight(
-            name='gamma',
-            shape=(dim,),
-            initializer='ones',
-            trainable=True)
-        
-        self.beta = self.add_weight(
-            name='beta',
-            shape=(dim,),
-            initializer='zeros',
-            trainable=True)
-    
-    def call(self, inputs):
-        input_shape = tf.shape(inputs)
-        reshaped_inputs = self._reshape_into_groups(inputs)
-        
-        normalized_inputs = self._apply_normalization(reshaped_inputs, input_shape)
-        
-        return tf.reshape(normalized_inputs, input_shape)
-    
-    def _reshape_into_groups(self, inputs):
-        input_shape = tf.shape(inputs)
-        group_shape = [input_shape[0], input_shape[1], self.groups, input_shape[2] // self.groups]
-        
-        # [batch, time, features] -> [batch, time, groups, features_per_group]
-        group_shaped_inputs = tf.reshape(inputs, group_shape)
-        
-        # [batch, time, groups, features_per_group] -> [batch, time, features_per_group, groups]
-        return tf.transpose(group_shaped_inputs, [0, 1, 3, 2])
-    
-    def _apply_normalization(self, reshaped_inputs, input_shape):
-        # 평균과 분산 계산
-        mean, variance = tf.nn.moments(reshaped_inputs, [1, 2], keepdims=True)
-        # 정규화
-        normalized_inputs = (reshaped_inputs - mean) / tf.sqrt(variance + self.epsilon)
-        
-        # 원래 형태로 복원
-        normalized_inputs = tf.transpose(normalized_inputs, [0, 1, 3, 2])
-        normalized_inputs = tf.reshape(normalized_inputs, input_shape)
-        
-        # 스케일 및 시프트 적용
-        return self.gamma * normalized_inputs + self.beta
-
-
-# 상대적 위치 임베딩 레이어
-class RelativePositionalEncoding(tf.keras.layers.Layer):
-    def __init__(self, dim, max_length=5000):
-        super(RelativePositionalEncoding, self).__init__()
-        self.dim = dim
-        pe = self._get_pos_encoding(max_length, dim)
-        self.pos_embedding = tf.Variable(
-            initial_value=pe,
-            trainable=True,
-            dtype=tf.float32,
-            name="pos_embedding"
-        )
-    
-    def _get_pos_encoding(self, max_length, d_model):
-        # 위치 임베딩 초기화
-        pos_enc = np.zeros((max_length, d_model))
-        for pos in range(max_length):
-            for i in range(0, d_model, 2):
-                pos_enc[pos, i] = np.sin(pos / (10000 ** (i / d_model)))
-                if i + 1 < d_model:
-                    pos_enc[pos, i + 1] = np.cos(pos / (10000 ** (i / d_model)))
-        return pos_enc
-    
-    def call(self, length):
-        return self.pos_embedding[:length]
-
-
-# ============ 기본 모델 컴포넌트 ============ #
-
-# 특징 추출기 (Feature Extractor) 구현
-class Wav2Vec2FeatureExtractor(tf.keras.layers.Layer):
-    def __init__(self, config):
-        super(Wav2Vec2FeatureExtractor, self).__init__()
-        self.config = config
-        
-        # 컨볼루션 레이어 스택 생성
-        self.conv_layers = []
-        
-        # 첫 번째 컨볼루션 레이어
-        self.conv_layers.append(
-            tf.keras.Sequential([
-                tf.keras.layers.Conv1D(
-                    filters=config.conv_dim[0],
-                    kernel_size=config.conv_kernel[0],
-                    strides=config.conv_stride[0],
-                    padding="same",
-                    use_bias=config.conv_bias,
-                    name="conv_0"
-                ),
-                GroupNormalization(groups=self.config.num_conv_pos_embedding_groups) if config.feat_extract_norm == "group" else tf.keras.layers.LayerNormalization(epsilon=1e-5),
-                tf.keras.layers.Activation(gelu if config.feat_extract_activation == "gelu" else "relu")
-            ])
-        )
-        
-        # 나머지 컨볼루션 레이어 추가
-        for i in range(1, len(config.conv_dim)):
-            self.conv_layers.append(
-                tf.keras.Sequential([
-                    tf.keras.layers.Conv1D(
-                        filters=config.conv_dim[i],
-                        kernel_size=config.conv_kernel[i],
-                        strides=config.conv_stride[i],
-                        padding="same",
-                        use_bias=config.conv_bias,
-                        name=f"conv_{i}"
-                    ),
-                    GroupNormalization(groups=self.config.num_conv_pos_embedding_groups) if config.feat_extract_norm == "group" else tf.keras.layers.LayerNormalization(epsilon=1e-5),
-                    tf.keras.layers.Activation(gelu if config.feat_extract_activation == "gelu" else "relu")
-                ])
-            )
-        
-        # 위치 인코딩 레이어
-        self.pos_conv_embed = tf.keras.layers.Conv1D(
-            filters=config.hidden_size,
-            kernel_size=config.num_conv_pos_embeddings,
-            padding="same",
-            groups=config.num_conv_pos_embedding_groups,
-            name="pos_conv_embed"
-        )
-        
-        # 레이어 정규화
-        self.layer_norm = tf.keras.layers.LayerNormalization(epsilon=config.layer_norm_eps)
-        self.dropout = tf.keras.layers.Dropout(config.hidden_dropout)
-    
-    def call(self, inputs, training=False):
-        hidden_states = tf.expand_dims(inputs, axis=-1)  # [batch, time] -> [batch, time, 1]
-        
-        # 컨볼루션 레이어 통과
-        for conv_layer in self.conv_layers:
-            hidden_states = conv_layer(hidden_states, training=training)
-        
-        # 위치 인코딩 추가
-        position_embeddings = self.pos_conv_embed(hidden_states)
-        
-        # 합산 및 정규화
-        hidden_states = hidden_states + position_embeddings
-        hidden_states = self.layer_norm(hidden_states)
-        hidden_states = self.dropout(hidden_states, training=training)
-        
-        return hidden_states
-
-
-# MultiHeadAttention 구현
-class Wav2Vec2MultiHeadAttention(tf.keras.layers.Layer):
-    def __init__(self, config):
-        super(Wav2Vec2MultiHeadAttention, self).__init__()
-        self.config = config
-        self.embed_dim = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.head_dim = self.embed_dim // self.num_heads
-        
-        if self.head_dim * self.num_heads != self.embed_dim:
-            raise ValueError(
-                f"embed_dim must be divisible by num_heads (got `embed_dim`: {self.embed_dim} and `num_heads`: {self.num_heads})."
-            )
-        
-        # 어텐션 프로젝션 레이어
-        self.q_proj = tf.keras.layers.Dense(self.embed_dim, use_bias=True, name="q_proj")
-        self.k_proj = tf.keras.layers.Dense(self.embed_dim, use_bias=True, name="k_proj")
-        self.v_proj = tf.keras.layers.Dense(self.embed_dim, use_bias=True, name="v_proj")
-        self.out_proj = tf.keras.layers.Dense(self.embed_dim, use_bias=True, name="out_proj")
-        
-        self.dropout = tf.keras.layers.Dropout(config.attention_dropout)
-    
-    def _reshape_for_multihead_attention(self, x):
-        batch_size = tf.shape(x)[0]
-        seq_length = tf.shape(x)[1]
-        
-        # [batch, time, embed_dim] -> [batch, time, num_heads, head_dim]
-        reshaped = tf.reshape(x, (batch_size, seq_length, self.num_heads, self.head_dim))
-        
-        # [batch, time, num_heads, head_dim] -> [batch, num_heads, time, head_dim]
-        return tf.transpose(reshaped, perm=[0, 2, 1, 3])
-    
-    def call(self, hidden_states, attention_mask=None, output_attentions=False, training=False):
-        batch_size = tf.shape(hidden_states)[0]
-        seq_length = tf.shape(hidden_states)[1]
-        
-        # 선형 투영
-        query_states = self.q_proj(hidden_states)  # [batch, time, embed_dim]
-        key_states = self.k_proj(hidden_states)    # [batch, time, embed_dim]
-        value_states = self.v_proj(hidden_states)  # [batch, time, embed_dim]
-        
-        # 다중 헤드 형태로 변환
-        query_states = self._reshape_for_multihead_attention(query_states)  # [batch, num_heads, time, head_dim]
-        key_states = self._reshape_for_multihead_attention(key_states)      # [batch, num_heads, time, head_dim]
-        value_states = self._reshape_for_multihead_attention(value_states)  # [batch, num_heads, time, head_dim]
-        
-        # QK^T 계산
-        attention_scores = tf.matmul(query_states, key_states, transpose_b=True)  # [batch, num_heads, time, time]
-        attention_scores = attention_scores / tf.math.sqrt(tf.cast(self.head_dim, tf.float32))
-        
-        # 어텐션 마스크 적용 (필요한 경우)
-        if attention_mask is not None:
-            # 마스크를 [batch, 1, 1, time] 형태로 변환하여 브로드캐스팅 활용
-            attention_mask = tf.expand_dims(tf.expand_dims(attention_mask, 1), 1)
-            attention_scores = attention_scores + (1.0 - attention_mask) * -10000.0
-        
-        # 소프트맥스 적용
-        attention_probs = tf.nn.softmax(attention_scores, axis=-1)
-        attention_probs = self.dropout(attention_probs, training=training)
-        
-        # 값과 어텐션 가중치 결합
-        context_states = tf.matmul(attention_probs, value_states)  # [batch, num_heads, time, head_dim]
-        
-        # 형태 변환: [batch, num_heads, time, head_dim] -> [batch, time, num_heads, head_dim]
-        context_states = tf.transpose(context_states, perm=[0, 2, 1, 3])
-        
-        # 최종 형태로 변환: [batch, time, embed_dim]
-        context_states = tf.reshape(context_states, (batch_size, seq_length, self.embed_dim))
-        
-        # 최종 프로젝션
-        output = self.out_proj(context_states)
-        
-        # 어텐션 가중치 반환 (필요한 경우)
-        outputs = (output, attention_probs) if output_attentions else (output,)
-        
-        return outputs
-
-
-# FeedForward 네트워크 구현
-class Wav2Vec2FeedForward(tf.keras.layers.Layer):
-    def __init__(self, config):
-        super(Wav2Vec2FeedForward, self).__init__()
-        self.intermediate_dense = tf.keras.layers.Dense(config.intermediate_size, name="intermediate_dense")
-        self.intermediate_act_fn = gelu if config.hidden_act == "gelu" else tf.keras.activations.get(config.hidden_act)
-        self.intermediate_dropout = tf.keras.layers.Dropout(config.activation_dropout)
-        
-        self.output_dense = tf.keras.layers.Dense(config.hidden_size, name="output_dense")
-        self.output_dropout = tf.keras.layers.Dropout(config.hidden_dropout)
-    
-    def call(self, hidden_states, training=False):
-        hidden_states = self.intermediate_dense(hidden_states)
-        hidden_states = self.intermediate_act_fn(hidden_states)
-        hidden_states = self.intermediate_dropout(hidden_states, training=training)
-        
-        hidden_states = self.output_dense(hidden_states)
-        hidden_states = self.output_dropout(hidden_states, training=training)
-        
-        return hidden_states
-
-
-# Transformer 인코더 레이어 구현
-class Wav2Vec2EncoderLayer(tf.keras.layers.Layer):
-    def __init__(self, config):
-        super(Wav2Vec2EncoderLayer, self).__init__()
-        self.config = config
-        self.do_stable_layer_norm = config.do_stable_layer_norm
-        
-        # 어텐션 레이어
-        self.attention = Wav2Vec2MultiHeadAttention(config)
-        self.attention_dropout = tf.keras.layers.Dropout(config.hidden_dropout)
-        self.attention_layer_norm = tf.keras.layers.LayerNormalization(epsilon=config.layer_norm_eps)
-        
-        # 피드포워드 레이어
-        self.feed_forward = Wav2Vec2FeedForward(config)
-        self.feed_forward_layer_norm = tf.keras.layers.LayerNormalization(epsilon=config.layer_norm_eps)
-    
-    def call(self, hidden_states, attention_mask=None, output_attentions=False, training=False):
-        # self-attention 레이어
-        if self.do_stable_layer_norm:
-            # 레이어 정규화 후 어텐션
-            attention_input = self.attention_layer_norm(hidden_states)
-            attention_outputs = self.attention(
-                attention_input,
-                attention_mask=attention_mask,
-                output_attentions=output_attentions,
-                training=training
-            )
-            attention_output = attention_outputs[0]
-            
-            # 잔차 연결
-            attention_output = self.attention_dropout(attention_output, training=training)
-            hidden_states = hidden_states + attention_output
-            
-            # 레이어 정규화 후 피드포워드
-            feed_forward_input = self.feed_forward_layer_norm(hidden_states)
-            feed_forward_output = self.feed_forward(feed_forward_input, training=training)
-            
-            # 잔차 연결
-            hidden_states = hidden_states + feed_forward_output
-        else:
-            # 기존 방식: 어텐션 후 레이어 정규화
-            attention_outputs = self.attention(
-                hidden_states,
-                attention_mask=attention_mask,
-                output_attentions=output_attentions,
-                training=training
-            )
-            attention_output = attention_outputs[0]
-            
-            # 잔차 연결 및 레이어 정규화
-            attention_output = self.attention_dropout(attention_output, training=training)
-            hidden_states = self.attention_layer_norm(hidden_states + attention_output)
-            
-            # 피드포워드 및 정규화
-            feed_forward_output = self.feed_forward(hidden_states, training=training)
-            hidden_states = self.feed_forward_layer_norm(hidden_states + feed_forward_output)
-        
-        outputs = (hidden_states,) + attention_outputs[1:] if output_attentions else (hidden_states,)
-        
-        return outputs
-
-
-# Transformer 인코더 구현
-class Wav2Vec2Encoder(tf.keras.layers.Layer):
-    def __init__(self, config):
-        super(Wav2Vec2Encoder, self).__init__()
-        self.config = config
-        self.layers = [Wav2Vec2EncoderLayer(config) for _ in range(config.num_hidden_layers)]
-        self.gradient_checkpointing = False
-        
-        # 가중치 합계를 위한 레이어 (필요한 경우)
-        self.layer_weights = None
-        if config.use_weighted_layer_sum:
-            self.layer_weights = tf.Variable(
-                initial_value=tf.ones(config.num_hidden_layers) / config.num_hidden_layers,
-                trainable=True,
-                dtype=tf.float32,
-                name="layer_weights"
-            )
-    
-    def call(self, 
-             hidden_states, 
-             attention_mask=None,
-             output_hidden_states=False, 
-             output_attentions=False, 
-             return_dict=True,
-             training=False):
-        all_hidden_states = () if output_hidden_states else None
-        all_attentions = () if output_attentions else None
-        
-        if self.config.use_weighted_layer_sum:
-            # 0번째 레이어 출력을 초기값으로 사용
-            layerwise_hidden_states = ()
-            for i, layer in enumerate(self.layers):
-                if output_hidden_states:
-                    all_hidden_states = all_hidden_states + (hidden_states,)
-                
-                # 정규화된 가중치 계산
-                layer_outputs = layer(
-                    hidden_states,
-                    attention_mask=attention_mask,
-                    output_attentions=output_attentions,
-                    training=training
-                )
-                hidden_states = layer_outputs[0]
-                
-                layerwise_hidden_states = layerwise_hidden_states + (hidden_states,)
-                
-                if output_attentions:
-                    all_attentions = all_attentions + (layer_outputs[1],)
-            
-            # 가중치 정규화
-            norm_weights = tf.nn.softmax(self.layer_weights, axis=-1)
-            
-            # 정규화된 가중치로 각 레이어의 출력 가중합 계산
-            hidden_states = tf.stack(layerwise_hidden_states, axis=0)  # [num_layers, batch, time, hidden_size]
-            hidden_states = tf.einsum("l,lbth->bth", norm_weights, hidden_states)
-        else:
-            # 기본 구현: 각 레이어 순차적으로 통과
-            for i, layer in enumerate(self.layers):
-                if output_hidden_states:
-                    all_hidden_states = all_hidden_states + (hidden_states,)
-                
-                layer_outputs = layer(
-                    hidden_states,
-                    attention_mask=attention_mask,
-                    output_attentions=output_attentions,
-                    training=training
-                )
-                hidden_states = layer_outputs[0]
-                
-                if output_attentions:
-                    all_attentions = all_attentions + (layer_outputs[1],)
-        
-        # 마지막 레이어 출력도 추가
-        if output_hidden_states:
-            all_hidden_states = all_hidden_states + (hidden_states,)
-        
-        if not return_dict:
-            return tuple(v for v in [hidden_states, all_hidden_states, all_attentions] if v is not None)
-        
-        return {
-            "last_hidden_state": hidden_states,
-            "hidden_states": all_hidden_states,
-            "attentions": all_attentions
-        }
-
-
-# 프로젝션 헤드 구현
-class Wav2Vec2ProjectionHead(tf.keras.layers.Layer):
-    def __init__(self, config):
-        super(Wav2Vec2ProjectionHead, self).__init__()
-        self.dense = tf.keras.layers.Dense(config.proj_codevector_dim, name="projection_head")
-        self.layer_norm = tf.keras.layers.LayerNormalization(epsilon=config.layer_norm_eps)
-        self.dropout = tf.keras.layers.Dropout(config.hidden_dropout)
-    
-    def call(self, hidden_states, training=False):
-        hidden_states = self.dense(hidden_states)
-        hidden_states = self.layer_norm(hidden_states)
-        hidden_states = self.dropout(hidden_states, training=training)
-        return hidden_states
-
-
-# ============ 주요 모델 클래스 ============ #
-
-# 메인 wav2vec2 모델 구현
-class Wav2Vec2Model(tf.keras.Model):
-    def __init__(self, config):
-        super(Wav2Vec2Model, self).__init__()
-        self.config = config
-        
-        # 특징 추출기 및 투영
-        self.feature_extractor = Wav2Vec2FeatureExtractor(config)
-        self.feature_projection = tf.keras.layers.Dense(config.hidden_size, name="feature_projection")
-        self.feature_projection_layer_norm = tf.keras.layers.LayerNormalization(epsilon=config.layer_norm_eps)
-        self.feature_projection_dropout = tf.keras.layers.Dropout(config.hidden_dropout)
-        
-        # 인코더
-        self.encoder = Wav2Vec2Encoder(config)
-        
-        # 양자화기 (pre-training에서 사용)
-        # 실제 구현은 생략되었지만 실제 사용 시 구현 필요
-        self.quantizer = None
-        
-        # 투영 헤드
-        self.project_hid = Wav2Vec2ProjectionHead(config)
-        self.project_q = Wav2Vec2ProjectionHead(config)
-    
-    def call(self, inputs, attention_mask=None, 
-             output_attentions=False, output_hidden_states=False,
-             return_dict=True, training=False):
-        
-        # 1. 특징 추출
-        extract_features = self.feature_extractor(inputs, training=training)
-        
-        # 2. 타겟 양자화를 위한 특징 제공
-        if training:
-            # 양자화 대상 특징
-            quantize_targets = extract_features
-            
-            # 양자화
-            quantized_result = self.quantizer(quantize_targets, training=True)
-            quantized_features = quantized_result["quantized_features"]
-            codevector_perplexity = quantized_result["codevector_perplexity"]
-        else:
-            quantized_features = None
-            codevector_perplexity = None
-        
-        # 3. 특징 투영
-        hidden_states = self.feature_projection(extract_features)
-        hidden_states = self.feature_projection_layer_norm(hidden_states)
-        hidden_states = self.feature_projection_dropout(hidden_states, training=training)
-        
-        # 4. 인코더에 전달
-        encoder_outputs = self.encoder(
-            hidden_states,
-            attention_mask=attention_mask,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-            training=training
-        )
-        
-        if not return_dict:
-            return encoder_outputs
-        
-        # 반환값 준비
-        result = {
-            "last_hidden_state": encoder_outputs["last_hidden_state"],
-            "extract_features": extract_features
-        }
-        
-        if quantized_features is not None:
-            result["quantized_features"] = quantized_features
-        
-        if codevector_perplexity is not None:
-            result["codevector_perplexity"] = codevector_perplexity
-        
-        if output_hidden_states:
-            result["hidden_states"] = encoder_outputs["hidden_states"]
-        
-        if output_attentions:
-            result["attentions"] = encoder_outputs["attentions"]
-        
-        return result
