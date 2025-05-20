@@ -742,6 +742,7 @@ class Wav2Vec2ForPreTraining(tf.keras.Model):
         
         return results
     
+    @tf.function
     def _compute_contrastive_loss(self, hidden_states, quantized_states):
         """컨트라스트 손실 계산"""
         batch_size, sequence_length, hidden_size = tf.shape(hidden_states)[0], tf.shape(hidden_states)[1], tf.shape(hidden_states)[2]
@@ -784,22 +785,38 @@ class Wav2Vec2ForPreTraining(tf.keras.Model):
         # 인위적으로 다양성을 높이기 위해 -perplexity를 최소화
         return -perplexity
     
+    @tf.function
     def _sample_negative_indices(self, sequence_length, batch_size):
         """컨트라스트 학습을 위한 부정 샘플 인덱스 생성"""
-        # [0, 1, 2, ..., sequence_length - 1]
+        # TensorFlow 그래프 모드에서 반복 처리를 벡터화된 연산으로 대체
+        
+        # 시퀀스 길이만큼의 범위 생성: [0, 1, 2, ..., sequence_length - 1]
         all_indices = tf.range(sequence_length)
         
-        # 배치별로 다른 무작위 인덱스 생성
-        neg_indices = tf.stack([
-            tf.random.shuffle(all_indices) for _ in range(batch_size)
-        ], axis=0)
+        # 고정된 시드로 무작위 인덱스 생성
+        # 참고: distributed training에서 일관성을 위해 고정된 시드 사용
+        shuffle_indices = tf.random.shuffle(all_indices, seed=42)
         
-        # 각 위치에 대해 num_negatives 개의 음수 샘플 선택
-        # [batch, time, num_negatives]
-        neg_indices = tf.stack([
-            tf.roll(neg_indices, shift=i+1, axis=1)[:, :self.num_negatives] 
-            for i in range(sequence_length)
-        ], axis=1)
+        # 배치 차원 추가하여 모든 배치에 대해 동일한 무작위 인덱스 사용
+        # [batch, time]
+        neg_indices = tf.tile(tf.expand_dims(shuffle_indices, 0), [batch_size, 1])
+        
+        # 음수 샘플 위치 조정을 위한 준비
+        # [time, batch, num_negatives] 형태로 구성
+        neg_indices_list = []
+        
+        # 각 위치별로 음수 샘플 인덱스 생성 (TF 연산만 사용)
+        for i in range(sequence_length):
+            # 현재 위치에서 i+1만큼 순환 이동하고 처음 num_negatives개 선택
+            shifted = tf.roll(neg_indices, shift=i+1, axis=1)
+            neg_sample = shifted[:, :self.num_negatives]
+            neg_indices_list.append(neg_sample)
+        
+        # [time, batch, num_negatives] 형태로 쌓기
+        neg_indices = tf.stack(neg_indices_list)
+        
+        # [batch, time, num_negatives] 형태로 변환
+        neg_indices = tf.transpose(neg_indices, [1, 0, 2])
         
         return neg_indices
 
@@ -1118,17 +1135,25 @@ def distributed_train_step(strategy, model, dist_inputs, optimizer):
             if isinstance(model, Wav2Vec2ForPreTraining):
                 outputs = model(features, training=True)
                 
-                # 컨트라스트 손실 계산
-                logits, contrastive_loss = model._compute_contrastive_loss(
-                    outputs["projected_states"],
-                    outputs["projected_quantized_features"]
-                )
-                
-                # 다양성 손실 추가
-                diversity_loss = model._compute_diversity_loss(outputs["codevector_perplexity"])
-                
-                # 최종 손실
-                loss = contrastive_loss + model.diversity_loss_weight * diversity_loss
+                # 필요한 텐서들이 모델에서 반환되는지 확인
+                if "projected_states" in outputs and "projected_quantized_features" in outputs:
+                    # 컨트라스트 손실 계산
+                    logits, contrastive_loss = model._compute_contrastive_loss(
+                        outputs["projected_states"],
+                        outputs["projected_quantized_features"]
+                    )
+                    
+                    # 다양성 손실 추가
+                    if "codevector_perplexity" in outputs:
+                        diversity_loss = model._compute_diversity_loss(outputs["codevector_perplexity"])
+                    else:
+                        diversity_loss = tf.constant(0.0)
+                    
+                    # 최종 손실
+                    loss = contrastive_loss + model.diversity_loss_weight * diversity_loss
+                else:
+                    # outputs에 직접 loss가 포함된 경우
+                    loss = outputs.get("loss", 0.0)
             else:
                 # ASR이나 분류 모델의 경우 labels 매개변수 전달
                 outputs = model(features, labels=labels, training=True)
