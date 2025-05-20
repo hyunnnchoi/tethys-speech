@@ -505,16 +505,22 @@ class Wav2Vec2Quantizer(tf.keras.layers.Layer):
             name="codevectors"
         )
         
+        # 입력 차원을 codevector_dim으로 투영하는 레이어 추가
+        self.projection = tf.keras.layers.Dense(config.codevector_dim, name="project_to_codevector_dim")
+        
         # 이 벡터는 contrastive loss에서 사용될 negative samples 관리에 필요
         self.neg_sample_indices = None
     
     def call(self, hidden_states, training=False):
         batch_size, sequence_length, hidden_size = tf.shape(hidden_states)[0], tf.shape(hidden_states)[1], tf.shape(hidden_states)[2]
         
+        # 입력을 codevector_dim으로 투영
+        hidden_states = self.projection(hidden_states)
+        
         # hidden_states를 그룹 수에 맞게 재구성
         hidden_states = tf.reshape(
             hidden_states, 
-            [batch_size, sequence_length, self.config.num_codevector_groups, hidden_size // self.config.num_codevector_groups]
+            [batch_size, sequence_length, self.config.num_codevector_groups, self.config.codevector_dim // self.config.num_codevector_groups]
         )
         
         # 각 그룹별로 코드벡터와의 거리 계산
@@ -611,10 +617,16 @@ class Wav2Vec2Model(tf.keras.Model):
         # 1. 특징 추출
         extract_features = self.feature_extractor(inputs, training=training)
         
-        # 2. 타겟 양자화를 위한 특징 제공
+        # 2. 특징 투영 - hidden_size 차원으로 투영
+        # 특징 추출기의 출력 차원(conv_dim[-1])과 인코더의 입력 차원(hidden_size)을 맞추기 위한 투영
+        hidden_states = self.feature_projection(extract_features)
+        hidden_states = self.feature_projection_layer_norm(hidden_states)
+        hidden_states = self.feature_projection_dropout(hidden_states, training=training)
+        
+        # 3. 타겟 양자화를 위한 특징 제공
         if training:
-            # 양자화 대상 특징
-            quantize_targets = extract_features
+            # 양자화 대상 특징 - 투영된 특징을 사용
+            quantize_targets = hidden_states
             
             # 양자화
             quantized_result = self.quantizer(quantize_targets, training=True)
@@ -623,12 +635,6 @@ class Wav2Vec2Model(tf.keras.Model):
         else:
             quantized_features = None
             codevector_perplexity = None
-        
-        # 3. 특징 투영 - hidden_size 차원으로 투영
-        # 특징 추출기의 출력 차원(conv_dim[-1])과 인코더의 입력 차원(hidden_size)를 맞추기 위한 투영
-        hidden_states = self.feature_projection(extract_features)
-        hidden_states = self.feature_projection_layer_norm(hidden_states)
-        hidden_states = self.feature_projection_dropout(hidden_states, training=training)
         
         # 4. 인코더에 전달
         encoder_outputs = self.encoder(
