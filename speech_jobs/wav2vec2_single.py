@@ -605,7 +605,6 @@ class Wav2Vec2Model(tf.keras.Model):
         self.encoder = Wav2Vec2Encoder(config)
         
         # 양자화기 (pre-training에서 사용)
-        # 실제 구현은 생략되었지만 실제 사용 시 구현 필요
         self.quantizer = Wav2Vec2Quantizer(config)
 
         # 투영 헤드
@@ -626,18 +625,18 @@ class Wav2Vec2Model(tf.keras.Model):
         hidden_states = self.feature_projection_dropout(hidden_states, training=training)
         
         # 3. 타겟 양자화를 위한 특징 제공
-        if training:
-            # 양자화 대상 특징 - 투영된 특징을 사용
-            quantize_targets = hidden_states
-            
-            # 양자화
-            quantized_result = self.quantizer(quantize_targets, training=True)
-            quantized_features = quantized_result["quantized_features"]
-            codevector_perplexity = quantized_result["codevector_perplexity"]
-        else:
-            quantized_features = None
-            codevector_perplexity = None
+        quantized_features = None
+        codevector_perplexity = None
         
+        # 양자화 수행 - 학습 중이 아니더라도 forward pass에서 계산함
+        # 이렇게 하면 그래디언트가 양자화기 레이어에 올바르게 흐름
+        quantize_targets = extract_features  # extract_features를 양자화 타겟으로 사용
+        
+        # 양자화
+        quantized_result = self.quantizer(quantize_targets, training=training)
+        quantized_features = quantized_result["quantized_features"]
+        codevector_perplexity = quantized_result["codevector_perplexity"]
+            
         # 4. 인코더에 전달
         encoder_outputs = self.encoder(
             hidden_states,
@@ -657,6 +656,7 @@ class Wav2Vec2Model(tf.keras.Model):
             "extract_features": extract_features
         }
         
+        # 항상 양자화 결과를 포함시킴 (학습 여부 관계없이)
         if quantized_features is not None:
             result["quantized_features"] = quantized_features
         
@@ -712,81 +712,84 @@ class Wav2Vec2ForPreTraining(tf.keras.Model):
     def train_step(self, data):
         inputs, _ = data
         
+        # 디버깅: 학습 가능한 변수 확인
+        print("\n--- 학습 가능한 변수 목록: ---")
+        quantizer_vars = []
+        for v in self.trainable_variables:
+            if 'quantizer' in v.name:
+                quantizer_vars.append(v.name)
+                print(f" - {v.name}")
+        print(f"양자화 관련 변수 개수: {len(quantizer_vars)}")
+        
         with tf.GradientTape() as tape:
             # 모델 순전파
             outputs = self(inputs, training=True)
             
             # 대조 손실 계산
-            logits, loss = self._compute_contrastive_loss(
-                outputs["projected_states"],
-                outputs["projected_quantized_features"]
-            )
+            projected_states = outputs["projected_states"]
+            projected_quantized_features = outputs["projected_quantized_features"]
             
-            # 다양성 손실 추가
-            diversity_loss = self._compute_diversity_loss(outputs["codevector_perplexity"])
+            # 양수 쌍 (같은 시간 위치의 인코더 출력과 양자화된 특징)
+            batch_size = tf.shape(projected_states)[0]
+            sequence_length = tf.shape(projected_states)[1]
             
-            # 최종 손실
-            total_loss = loss + self.diversity_loss_weight * diversity_loss
-        
-        # 그래디언트 계산 및 적용
-        gradients = tape.gradient(total_loss, self.trainable_variables)
-        self.optimizer.apply_gradients(zip(gradients, self.trainable_variables))
-        
-        # 손실 기록
-        self.compiled_metrics.update_state(0, total_loss)
-        
-        results = {m.name: m.result() for m in self.metrics}
-        results.update({
-            "contrastive_loss": loss,
-            "diversity_loss": diversity_loss,
-            "perplexity": outputs["codevector_perplexity"]
-        })
-        
-        return results
-    
-    @tf.function
-    def _compute_contrastive_loss(self, hidden_states, quantized_states):
-        """컨트라스트 손실 계산"""
-        batch_size = tf.shape(hidden_states)[0]
-        sequence_length = tf.shape(hidden_states)[1]
-        
-        # 양수 쌍 (같은 시간 위치의 인코더 출력과 양자화된 특징)
-        pos_logits = tf.reduce_sum(hidden_states * quantized_states, axis=-1) / self.contrastive_logits_temperature
-        
-        # 음수 쌍
-        if self.num_negatives > 0:
-            # 타임프레임을 섞어 부정 샘플 생성
+            # 양수 쌍 로짓 계산
+            pos_logits = tf.reduce_sum(projected_states * projected_quantized_features, axis=-1) / self.contrastive_logits_temperature
+            
+            # 타임프레임을 섞어 부정 샘플 생성 (이 부분이 중요)
             neg_indices = self._sample_negative_indices(sequence_length, batch_size)
+            neg_quantized = tf.gather(projected_quantized_features, neg_indices, axis=1, batch_dims=1)
             
-            # 부정 샘플 가져오기 - 안전한 tf.gather 호출
-            neg_quantized = tf.gather(quantized_states, neg_indices, axis=1, batch_dims=1)
-            
-            # hidden_states: [batch, time, dim], neg_quantized: [batch, time, neg, dim]
             # 확장하여 효율적인 내적 계산
-            hidden_states_expanded = tf.expand_dims(hidden_states, axis=2)  # [batch, time, 1, dim]
+            hidden_states_expanded = tf.expand_dims(projected_states, axis=2)  # [batch, time, 1, dim]
             
             # 음수 로짓 계산
             neg_logits = tf.reduce_sum(hidden_states_expanded * neg_quantized, axis=-1) / self.contrastive_logits_temperature
             
             # 양수와 음수 로짓 결합
             logits = tf.concat([tf.expand_dims(pos_logits, axis=2), neg_logits], axis=2)
+            
+            # 첫 번째 인덱스 (양수 쌍)에 대한 예측 손실 계산
+            labels = tf.zeros(tf.shape(logits)[:-1], dtype=tf.int32)
+            contrastive_loss = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=labels, logits=logits)
+            contrastive_loss = tf.reduce_mean(contrastive_loss)
+            
+            # 다양성 손실 추가 (코드북 활용도를 높이기 위함)
+            diversity_loss = -outputs["codevector_perplexity"]  # 퍼플렉시티가 높을수록 다양성이 높음
+            
+            # 최종 손실 계산
+            loss = contrastive_loss + self.diversity_loss_weight * diversity_loss
+        
+        # 그래디언트 계산
+        gradients = tape.gradient(loss, self.trainable_variables)
+        
+        # 그래디언트 디버깅
+        print("\n--- 그래디언트 상태 확인: ---")
+        none_gradients = []
+        for var, grad in zip(self.trainable_variables, gradients):
+            if grad is None:
+                none_gradients.append(var.name)
+                print(f" - {var.name}: 그래디언트 없음")
+        
+        if none_gradients:
+            print(f"그래디언트가 없는 변수 개수: {len(none_gradients)}")
         else:
-            logits = tf.expand_dims(pos_logits, axis=2)
+            print("모든 변수에 그래디언트가 있습니다.")
         
-        # 첫 번째 인덱스 (양수 쌍)에 대한 예측 손실 계산
-        labels = tf.zeros(tf.shape(logits)[:-1], dtype=tf.int32)
-        loss = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=labels, logits=logits)
+        # 그래디언트 적용
+        self.optimizer.apply_gradients(zip(gradients, self.trainable_variables))
         
-        # 마스크가 있는 경우 손실에 적용
-        # (여기서는 간소화를 위해 모든 위치가 유효하다고 가정)
+        # 손실 기록
+        self.compiled_metrics.update_state(0, loss)
         
-        return logits, tf.reduce_mean(loss)
-    
-    def _compute_diversity_loss(self, perplexity):
-        """다양성 손실 계산 - 코드북 활용도를 높이기 위함"""
-        # 퍼플렉시티가 높을수록 다양성이 높음을 의미
-        # 인위적으로 다양성을 높이기 위해 -perplexity를 최소화
-        return -perplexity
+        results = {m.name: m.result() for m in self.metrics}
+        results.update({
+            "contrastive_loss": contrastive_loss,
+            "diversity_loss": diversity_loss,
+            "perplexity": outputs["codevector_perplexity"]
+        })
+        
+        return results
     
     @tf.function
     def _sample_negative_indices(self, sequence_length, batch_size):
@@ -1147,40 +1150,21 @@ def train_step(model, inputs, optimizer):
     """단일 GPU 학습을 위한 스텝 함수"""
     features, labels = inputs
     
-    with tf.GradientTape() as tape:
-        # 모델 타입에 따라 다른 호출 방식 적용
-        if isinstance(model, Wav2Vec2ForPreTraining):
-            outputs = model(features, training=True)
-            
-            # 필요한 텐서들이 모델에서 반환되는지 확인
-            if "projected_states" in outputs and "projected_quantized_features" in outputs:
-                # 컨트라스트 손실 계산
-                logits, contrastive_loss = model._compute_contrastive_loss(
-                    outputs["projected_states"],
-                    outputs["projected_quantized_features"]
-                )
-                
-                # 다양성 손실 추가
-                if "codevector_perplexity" in outputs:
-                    diversity_loss = model._compute_diversity_loss(outputs["codevector_perplexity"])
-                else:
-                    diversity_loss = tf.constant(0.0)
-                
-                # 최종 손실
-                loss = contrastive_loss + model.diversity_loss_weight * diversity_loss
-            else:
-                # outputs에 직접 loss가 포함된 경우
-                loss = outputs.get("loss", 0.0)
-        else:
-            # ASR이나 분류 모델의 경우 labels 매개변수 전달
+    if isinstance(model, Wav2Vec2ForPreTraining):
+        # 사전학습 모델은 자체 train_step 메소드 사용
+        return model.train_step(inputs)
+    else:
+        # 다른 모델(ASR, 분류 등)의 경우 기존 로직 유지
+        with tf.GradientTape() as tape:
+            # 모델 타입에 따라 다른 호출 방식 적용
             outputs = model(features, labels=labels, training=True)
             loss = outputs["loss"]
-    
-    # 그래디언트 계산 및 적용
-    gradients = tape.gradient(loss, model.trainable_variables)
-    optimizer.apply_gradients(zip(gradients, model.trainable_variables))
-    
-    return loss
+        
+        # 그래디언트 계산 및 적용
+        gradients = tape.gradient(loss, model.trainable_variables)
+        optimizer.apply_gradients(zip(gradients, model.trainable_variables))
+        
+        return loss
 
 
 # wav2vec2 모델 메인 학습 함수 (단일 GPU용)
