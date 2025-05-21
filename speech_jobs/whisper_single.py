@@ -1205,7 +1205,7 @@ def train_wav2vec2(model_type="pretraining", num_epochs=1, learning_rate=3e-5):
         ])
     
     # 모델 컴파일
-    model.compile(optimizer=optimizer, metrics=metrics)
+    model.compile(optimizer=optimizer, loss=tf.keras.losses.MeanSquaredError(), metrics=metrics)
     
     # 데이터셋 생성
     train_dataset = create_dummy_dataset(BATCH_SIZE)
