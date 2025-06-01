@@ -1295,6 +1295,12 @@ def train_wav2vec2(strategy, model_type="pretraining", model_size="small", num_e
     
     # 데이터셋 생성
     train_dataset = create_dummy_dataset(GLOBAL_BATCH_SIZE)
+    
+    # 데이터셋 샤딩 정책 설정 (TensorFlow 경고에 따름)
+    options = tf.data.Options()
+    options.experimental_distribute.auto_shard_policy = tf.data.experimental.AutoShardPolicy.DATA
+    train_dataset = train_dataset.with_options(options)
+    
     dist_dataset = strategy.experimental_distribute_dataset(train_dataset)
     
     # 체크포인트 설정
@@ -1461,7 +1467,7 @@ if __name__ == "__main__":
 
     # 분산 학습 전략 설정 - 안정성 개선
     os.environ['GRPC_VERBOSITY'] = 'ERROR'
-    os.environ['TF_GRPC_DEFAULT_OPTIONS'] = 'grpc.keepalive_time_ms=30000,grpc.keepalive_timeout_ms=5000,grpc.keepalive_permit_without_calls=true,grpc.http2.max_pings_without_data=0,grpc.http2.min_time_between_pings_ms=10000,grpc.http2.min_ping_interval_without_data_ms=300000'
+    os.environ['TF_GRPC_DEFAULT_OPTIONS'] = 'grpc.keepalive_time_ms=30000,grpc.keepalive_timeout_ms=5000,grpc.keepalive_permit_without_calls=1,grpc.http2.max_pings_without_data=0,grpc.http2.min_time_between_pings_ms=10000,grpc.http2.min_ping_interval_without_data_ms=300000'
     os.environ['TF_COLLECTIVE_OP_TIMEOUT'] = '300'
     
     # 통신 옵션으로 안정성 향상
