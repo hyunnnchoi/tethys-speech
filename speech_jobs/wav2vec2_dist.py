@@ -1120,35 +1120,26 @@ def apply_feature_mask(hidden_states, mask_prob=0.05, mask_length=10):
     return masked_hidden_states, expanded_mask
 
 
-# 더미 오디오 데이터셋 생성 (수정됨)
+# 더미 오디오 데이터셋 생성 (수정됨 - from_generator 대신 range().map() 사용)
 def create_dummy_dataset(batch_size):
     """
     형태가 일관된 더미 오디오 데이터셋 생성 - 메모리 절약을 위해 길이 단축
+    from_generator 대신 range().map()을 사용하여 스레드 누수 가능성 회피
     """
-    def generate_consistent_data():
-        # 메모리 절약을 위해 더 짧은 오디오 데이터 생성 (2초)
-        audio_length = 32000  # 2초 * 16kHz (기존 5초에서 단축)
-        
-        # 더미 오디오 특징 생성
+    audio_length = 32000  # 2초 * 16kHz
+
+    def generate_dummy_sample(_): # map 함수는 인자를 받으므로 _로 처리
         audio_features = tf.random.normal([audio_length], dtype=tf.float32)
-        
-        # 더미 레이블
         label = tf.constant(0.0, dtype=tf.float32)
-        
         return audio_features, label
-    
-    # 데이터셋 생성
-    dataset = tf.data.Dataset.from_generator(
-        lambda: [generate_consistent_data() for _ in range(50)],
-        output_signature=(
-            tf.TensorSpec(shape=[32000], dtype=tf.float32),  # 길이 변경
-            tf.TensorSpec(shape=[], dtype=tf.float32)
-        )
-    )
+
+    # 데이터셋 생성 (50개의 더미 샘플 생성)
+    dataset = tf.data.Dataset.range(50) # 50개의 인덱스 생성
+    dataset = dataset.map(generate_dummy_sample, num_parallel_calls=tf.data.AUTOTUNE)
     
     # 배치 처리 - drop_remainder=True로 일관된 배치 크기 보장
     dataset = dataset.batch(batch_size, drop_remainder=True)
-    dataset = dataset.repeat()
+    dataset = dataset.repeat() # 학습을 위해 반복
     dataset = dataset.prefetch(tf.data.AUTOTUNE)
     
     return dataset
