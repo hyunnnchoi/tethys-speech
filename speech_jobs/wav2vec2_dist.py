@@ -861,6 +861,80 @@ class Wav2Vec2ForPreTraining(tf.keras.Model):
             outputs["projected_states"] = transformer_features
         
         return outputs
+    
+    @tf.function
+    def _compute_contrastive_loss(self, hidden_states, quantized_states):
+        """개선된 컨트라스트 손실 계산"""
+        batch_size = tf.shape(hidden_states)[0]
+        sequence_length = tf.shape(hidden_states)[1]
+        
+        # 빈 배치 처리
+        if tf.equal(batch_size, 0):
+            return tf.zeros([0, 0, 1], dtype=tf.float32), tf.constant(0.0)
+        
+        # 양수 쌍 계산
+        pos_logits = tf.reduce_sum(hidden_states * quantized_states, axis=-1) / self.contrastive_logits_temperature
+        
+        # 음수 쌍 생성 (개선된 방법)
+        if self.num_negatives > 0:
+            # 더 안전한 negative sampling
+            neg_indices = self._sample_negative_indices(sequence_length, batch_size)
+            
+            # 안전한 gather 연산
+            neg_quantized = tf.gather(quantized_states, neg_indices, axis=1, batch_dims=1)
+            
+            # 차원 확장 및 로짓 계산
+            hidden_states_expanded = tf.expand_dims(hidden_states, axis=2)
+            neg_logits = tf.reduce_sum(hidden_states_expanded * neg_quantized, axis=-1) / self.contrastive_logits_temperature
+            
+            # 로짓 결합
+            logits = tf.concat([tf.expand_dims(pos_logits, axis=2), neg_logits], axis=2)
+        else:
+            logits = tf.expand_dims(pos_logits, axis=2)
+        
+        # 손실 계산
+        labels = tf.zeros([batch_size, sequence_length], dtype=tf.int32)
+        loss = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=labels, logits=logits)
+        
+        return logits, tf.reduce_mean(loss)
+    
+    def _compute_diversity_loss(self, perplexity):
+        """다양성 손실 계산 - 코드북 활용도를 높이기 위함"""
+        # 퍼플렉시티가 높을수록 다양성이 높음을 의미
+        # 인위적으로 다양성을 높이기 위해 -perplexity를 최소화
+        return -perplexity
+    
+    @tf.function  
+    def _sample_negative_indices(self, sequence_length, batch_size):
+        """안전한 negative sampling - TensorFlow 그래프 호환"""
+        # sequence_length가 num_negatives보다 작은 경우 처리
+        actual_negatives = tf.minimum(self.num_negatives, sequence_length - 1)
+        actual_negatives = tf.maximum(actual_negatives, 1)  # 최소 1개는 보장
+        
+        # 배치별로 negative 인덱스 생성 (벡터화된 방식)
+        indices_range = tf.range(sequence_length)
+        
+        # 각 배치에 대해 독립적으로 셔플
+        # tf.random.shuffle은 배치 차원에서 작동하지 않으므로 다른 방법 사용
+        random_indices = tf.random.uniform([batch_size, sequence_length], maxval=sequence_length, dtype=tf.int32)
+        
+        # 상위 actual_negatives개만 선택
+        _, top_indices = tf.nn.top_k(-tf.cast(random_indices, tf.float32), k=actual_negatives)
+        
+        # 필요한 개수만큼 확장 (self.num_negatives에 맞춤)
+        if actual_negatives < self.num_negatives:
+            # 반복하여 필요한 크기까지 확장
+            repeat_times = tf.cast(tf.math.ceil(self.num_negatives / actual_negatives), tf.int32)
+            repeated_indices = tf.tile(top_indices, [1, repeat_times])
+            # 정확한 크기로 자르기
+            neg_indices = repeated_indices[:, :self.num_negatives]
+        else:
+            neg_indices = top_indices[:, :self.num_negatives]
+        
+        # [batch_size, sequence_length, num_negatives] 형태로 확장
+        neg_indices = tf.tile(tf.expand_dims(neg_indices, axis=1), [1, sequence_length, 1])
+        
+        return neg_indices
 
 # wav2vec2 음성 인식(ASR) 모델 구현
 class Wav2Vec2ForCTC(tf.keras.Model):
