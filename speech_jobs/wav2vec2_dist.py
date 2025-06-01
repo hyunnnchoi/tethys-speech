@@ -1451,7 +1451,6 @@ def train_wav2vec2(strategy, task_type, model_type="pretraining", model_size="sm
     
     # 메모리 사용량 최적화
     options.experimental_optimization.map_and_batch_fusion = False
-    options.experimental_optimization.map_vectorization.enabled = False
     
     train_dataset = train_dataset.with_options(options)
     dist_dataset = strategy.experimental_distribute_dataset(train_dataset)
