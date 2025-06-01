@@ -1241,28 +1241,42 @@ def apply_feature_mask(hidden_states, mask_prob=0.05, mask_length=10):
 
 # 더미 오디오 데이터셋 생성 (수정됨 - from_generator 대신 range().map() 사용)
 def create_dummy_dataset(batch_size):
-    """
-    Thread 누수를 완전히 방지하는 더미 데이터셋 생성
-    """
-    audio_length = 32000  # 2초 * 16kHz
-
+    """더미 데이터셋 생성 (스레드 누수 방지를 위한 엄격한 설정)"""
+    
     def generate_dummy_sample(_):
-        audio_features = tf.random.normal([audio_length], dtype=tf.float32)
-        label = tf.constant(0.0, dtype=tf.float32)
-        return audio_features, label
-
-    # 데이터셋 생성 - 매우 보수적인 설정
-    dataset = tf.data.Dataset.range(100)  # 더 작은 데이터셋
+        # 16kHz 오디오, 1초 길이
+        audio_length = 16000
+        dummy_audio = tf.random.normal([audio_length], dtype=tf.float32)
+        
+        # 더미 레이블 (10개 클래스 중 하나)
+        dummy_label = tf.random.uniform([], minval=0, maxval=10, dtype=tf.int32)
+        
+        return dummy_audio, dummy_label
     
-    # Thread 사용 완전히 제한
-    dataset = dataset.map(generate_dummy_sample, num_parallel_calls=1)  # 병렬 처리 완전 제거
+    # 데이터셋 생성
+    dataset = tf.data.Dataset.range(1000)  # 1000개 샘플
     
-    # 배치 처리
+    # 스레드 누수 방지를 위한 엄격한 설정
+    options = tf.data.Options()
+    options.threading.private_threadpool_size = 1  # 스레드 풀 크기 제한
+    options.threading.max_intra_op_parallelism = 1  # 연산 내 병렬성 제한
+    options.experimental_optimization.parallel_batch = False  # 병렬 배치 비활성화
+    options.experimental_optimization.map_parallelization = False  # 맵 병렬화 비활성화
+    options.experimental_deterministic = True  # 결정적 실행
+    
+    dataset = dataset.with_options(options)
+    
+    # 맵 함수에서도 num_parallel_calls=1로 설정
+    dataset = dataset.map(
+        generate_dummy_sample,
+        num_parallel_calls=1
+    )
+    
+    # 배치 설정에서도 drop_remainder=True로 설정하여 부분 배치 방지
     dataset = dataset.batch(batch_size, drop_remainder=True)
-    dataset = dataset.repeat()  # 무한 반복
     
-    # prefetch도 최소화
-    dataset = dataset.prefetch(buffer_size=1)  # 버퍼 크기 최소화
+    # 프리페치도 1로 제한
+    dataset = dataset.prefetch(1)
     
     return dataset
 
@@ -1341,46 +1355,53 @@ def distributed_train_step_tf_func(strategy, model, dist_inputs, optimizer):
         features, labels = inputs
         
         with tf.GradientTape() as tape:
-            # 단순하게 모델 호출
+            # 모델 호출
             outputs = model(features, training=True)
             
-            # 기본 L2 손실 계산 (outputs의 모든 텐서 평균)
-            if isinstance(outputs, dict):
-                # 딕셔너리인 경우, 주요 출력들로 손실 계산
-                loss = tf.constant(0.0, dtype=tf.float32)
-                count = 0
-                
-                for key, value in outputs.items():
-                    if value is not None and hasattr(value, 'dtype') and value.dtype == tf.float32:
-                        loss += tf.reduce_mean(tf.square(value))
-                        count += 1
-                
-                if count > 0:
-                    loss = loss / tf.cast(count, tf.float32)
+            # Wav2Vec2ForPreTraining 모델의 경우
+            if isinstance(model, Wav2Vec2ForPreTraining):
+                if "projected_states" in outputs and "projected_quantized_features" in outputs:
+                    # 컨트라스트 손실 계산
+                    logits, contrastive_loss = model._compute_contrastive_loss(
+                        outputs["projected_states"],
+                        outputs["projected_quantized_features"]
+                    )
+                    
+                    # 다양성 손실 추가
+                    if "codevector_perplexity" in outputs:
+                        diversity_loss = model._compute_diversity_loss(outputs["codevector_perplexity"])
+                    else:
+                        diversity_loss = tf.constant(0.0)
+                    
+                    # 최종 손실
+                    loss = contrastive_loss + model.diversity_loss_weight * diversity_loss
                 else:
-                    loss = tf.constant(1.0, dtype=tf.float32)
+                    loss = tf.constant(0.0)
             else:
-                # 텐서인 경우 직접 손실 계산
-                loss = tf.reduce_mean(tf.square(outputs))
+                # 다른 모델 타입의 경우
+                outputs = model(features, labels=labels, training=True)
+                loss = outputs.get("loss", 0.0)
+            
+            # NaN 체크
+            loss = tf.where(tf.math.is_nan(loss), tf.constant(0.0), loss)
             
             # 스케일링
             scaled_loss = loss / tf.cast(strategy.num_replicas_in_sync, tf.float32)
         
-        # 그래디언트 계산 및 적용
+        # 그래디언트 계산
         gradients = tape.gradient(scaled_loss, model.trainable_variables)
         
-        # None gradients 처리
-        valid_gradients = []
-        valid_variables = []
-        for grad, var in zip(gradients, model.trainable_variables):
-            if grad is not None:
-                valid_gradients.append(grad)
-                valid_variables.append(var)
+        # None 그래디언트 필터링
+        gradients = [
+            tf.zeros_like(var) if grad is None else grad 
+            for grad, var in zip(gradients, model.trainable_variables)
+        ]
         
-        if valid_gradients:
-            # 그래디언트 클리핑
-            clipped_gradients, _ = tf.clip_by_global_norm(valid_gradients, 1.0)
-            optimizer.apply_gradients(zip(clipped_gradients, valid_variables))
+        # 그래디언트 클리핑
+        gradients, _ = tf.clip_by_global_norm(gradients, 1.0)
+        
+        # 옵티마이저 적용
+        optimizer.apply_gradients(zip(gradients, model.trainable_variables))
         
         return scaled_loss
     
@@ -1389,6 +1410,7 @@ def distributed_train_step_tf_func(strategy, model, dist_inputs, optimizer):
 
 # wav2vec2 모델 메인 학습 함수 (수정됨)
 def train_wav2vec2(strategy, task_type, model_type="pretraining", model_size="small", num_epochs=1, learning_rate=3e-5):
+    """Wav2Vec2 모델 학습 함수 (스레드 누수 방지를 위한 엄격한 설정 추가)"""
     if task_type == 'chief':
         print("--- train_wav2vec2 시작 전 리소스 상태 ---")
         log_system_resources()
@@ -1413,24 +1435,33 @@ def train_wav2vec2(strategy, task_type, model_type="pretraining", model_size="sm
             ])
         model.compile(optimizer=optimizer, metrics=metrics)
 
+    # 데이터셋 생성 및 엄격한 옵션 설정
     train_dataset = create_dummy_dataset(GLOBAL_BATCH_SIZE)
+    
+    # 분산 데이터셋 옵션 설정
     options = tf.data.Options()
     options.experimental_distribute.auto_shard_policy = tf.data.experimental.AutoShardPolicy.DATA
-    # Thread 누수 완전 방지를 위한 최대한 엄격한 설정
-    options.threading.private_threadpool_size = 1  # 최소 Thread 수
-    options.threading.max_intra_op_parallelism = 1  # 완전히 직렬 처리
-    options.experimental_optimization.parallel_batch = False  # 병렬 배치 처리 비활성화
-    options.experimental_optimization.map_parallelization = False  # 맵 병렬화 비활성화
-    options.experimental_deterministic = True  # 결정적 처리
+    
+    # 스레드 누수 방지를 위한 엄격한 설정
+    options.threading.private_threadpool_size = 1
+    options.threading.max_intra_op_parallelism = 1
+    options.experimental_optimization.parallel_batch = False
+    options.experimental_optimization.map_parallelization = False
+    options.experimental_deterministic = True
+    
+    # 메모리 사용량 최적화
+    options.experimental_optimization.map_and_batch_fusion = False
+    options.experimental_optimization.map_vectorization.enabled = False
+    
     train_dataset = train_dataset.with_options(options)
     dist_dataset = strategy.experimental_distribute_dataset(train_dataset)
     
+    # 체크포인트 설정
     checkpoint_dir = '/workspace/checkpoints'
     os.makedirs(checkpoint_dir, exist_ok=True)
     checkpoint = tf.train.Checkpoint(model=model, optimizer=optimizer)
 
     step = 0
-    # iterator를 한 번만 생성하고 재사용
     iterator = iter(dist_dataset)
     start_time = time.time()
     
@@ -1446,47 +1477,38 @@ def train_wav2vec2(strategy, task_type, model_type="pretraining", model_size="sm
             try:
                 inputs = next(iterator)
                 step_start = time.time()
-                # @tf.function으로 데코레이트된 함수 호출
                 loss = distributed_train_step_tf_func(strategy, model, inputs, optimizer)
                 step_end = time.time()
                 step_duration = step_end - step_start
                 elapsed = step_end - start_time
+                
                 if task_type == 'chief':
-                    try: 
-                        loss_value = float(loss)
-                        # 디버깅: 손실값이 정상적인지 확인
-                        if loss_value > 0:
-                            print(f"✓ Step {step}, Loss: {loss_value:.4f}, Time: {time.strftime('%H:%M:%S')} (경과: {elapsed:.2f}초, 스텝 시간: {step_duration:.2f}초)")
-                        else:
-                            print(f"⚠ Step {step}, Loss: {loss_value:.4f} (Zero loss), Time: {time.strftime('%H:%M:%S')} (경과: {elapsed:.2f}초, 스텝 시간: {step_duration:.2f}초)")
-                    except Exception as e: 
-                        print(f"✗ Step {step}, Loss conversion error: {e}, Time: {time.strftime('%H:%M:%S')} (경과: {elapsed:.2f}초, 스텝 시간: {step_duration:.2f}초)")
-                        loss_value = 0.0
-                    if step % 1 == 0: 
-                        log_system_resources()
-                step += 1
-                if task_type == 'chief' and step % 50 == 0:
-                    checkpoint.save(os.path.join(checkpoint_dir, f"model_step_{step}"))
-            except StopIteration:
-                # StopIteration 발생 시 iterator 재생성하지 않고 break
-                if task_type == 'chief':
-                    print(f"데이터셋 소진으로 에포크 {epoch+1} 조기 종료 (Step {step})")
-                break
-            except Exception as e:
-                if task_type == 'chief':
-                    print(f"Error at step {step}: {e}")
+                    print(f"✓ Step {step}, Loss: {loss:.4f}, Time: {time.strftime('%H:%M:%S')} (경과: {elapsed:.2f}초, 스텝 시간: {step_duration:.2f}초)")
                     log_system_resources()
-                # 에러 발생 시 iterator 재생성하지 않고 continue
+                
+                step += 1
+                
+            except StopIteration:
+                iterator = iter(dist_dataset)
                 continue
         
         if task_type == 'chief':
-            checkpoint.save(os.path.join(checkpoint_dir, f"model_epoch_{epoch+1}"))
             print("--- train_wav2vec2 중간 리소스 상태 (에포크 종료) ---")
             log_system_resources()
+            
+            # 에포크 종료 후 체크포인트 저장
+            checkpoint.save(os.path.join(checkpoint_dir, f"wav2vec2_{model_size}_epoch_{epoch+1}"))
     
     if task_type == 'chief':
         print("--- train_wav2vec2 종료 직후 리소스 상태 ---")
         log_system_resources()
+        print("Training completed.")
+        
+        # 모델 저장
+        model_save_path = f'/workspace/model_cache/wav2vec2_{model_size}_model'
+        model.save(model_save_path)
+        print(f"{model_size.capitalize()} 모델이 {model_save_path}에 저장되었습니다.")
+    
     return model
 
 
