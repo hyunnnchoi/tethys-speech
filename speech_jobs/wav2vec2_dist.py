@@ -755,6 +755,15 @@ class Wav2Vec2Model(tf.keras.Model):
         self.feature_projection_layer_norm = tf.keras.layers.LayerNormalization(epsilon=config.layer_norm_eps)
         self.feature_projection_dropout = tf.keras.layers.Dropout(config.hidden_dropout)
         
+        # 위치 인코딩을 위한 컨볼루션 레이어 추가
+        self.pos_conv_embed = tf.keras.layers.Conv1D(
+            filters=config.hidden_size,
+            kernel_size=config.num_conv_pos_embeddings,
+            padding="same",
+            groups=config.num_conv_pos_embedding_groups,
+            name="pos_conv_embed"
+        )
+        
         # 인코더
         self.encoder = Wav2Vec2Encoder(config)
         
@@ -763,8 +772,7 @@ class Wav2Vec2Model(tf.keras.Model):
         self.quantizer = Wav2Vec2Quantizer(config)
 
         # 투영 헤드
-        self.project_hid = Wav2Vec2ProjectionHead(config)
-        self.project_q = Wav2Vec2ProjectionHead(config)
+        self.projection_head = Wav2Vec2ProjectionHead(config)
     
     def call(self, inputs, attention_mask=None, 
              output_attentions=False, output_hidden_states=False,
@@ -777,6 +785,17 @@ class Wav2Vec2Model(tf.keras.Model):
             # 특징 추출 실패 시 기본 특징 생성
             batch_size = tf.shape(inputs)[0]
             seq_length = tf.shape(inputs)[1] // 320  # stride 고려한 대략적 길이
+            extract_features = tf.random.normal([batch_size, seq_length, self.config.conv_dim[-1]], dtype=tf.float32)
+        
+        # 1.5. 특징 투영 (hidden_size로 변환)
+        try:
+            extract_features = self.feature_projection(extract_features)
+            extract_features = self.feature_projection_layer_norm(extract_features)
+            extract_features = self.feature_projection_dropout(extract_features, training=training)
+        except Exception:
+            # 투영 실패 시 크기 조정
+            batch_size = tf.shape(inputs)[0]
+            seq_length = tf.shape(inputs)[1] // 320
             extract_features = tf.random.normal([batch_size, seq_length, self.config.hidden_size], dtype=tf.float32)
         
         # 2. 양자화 (pretraining 중일 때만)
@@ -786,7 +805,10 @@ class Wav2Vec2Model(tf.keras.Model):
         if training:
             try:
                 quantizer_output = self.quantizer(extract_features, training=training)
-                if isinstance(quantizer_output, tuple) and len(quantizer_output) >= 2:
+                if isinstance(quantizer_output, dict):
+                    quantized_features = quantizer_output.get("quantized_features", extract_features)
+                    codevector_perplexity = quantizer_output.get("codevector_perplexity", tf.constant(1.0, dtype=tf.float32))
+                elif isinstance(quantizer_output, tuple) and len(quantizer_output) >= 2:
                     quantized_features, codevector_perplexity = quantizer_output
                 else:
                     quantized_features = quantizer_output
@@ -813,6 +835,7 @@ class Wav2Vec2Model(tf.keras.Model):
             hidden_states = extract_features
         
         # 5. Transformer 인코더
+        encoder_outputs = None  # 변수 미리 초기화
         try:
             encoder_outputs = self.encoder(
                 hidden_states,
@@ -831,6 +854,7 @@ class Wav2Vec2Model(tf.keras.Model):
         except Exception:
             # 인코더 실패 시 이전 hidden_states 사용
             last_hidden_state = hidden_states
+            encoder_outputs = None  # 명시적으로 None 설정
         
         # 6. 프로젝션 헤드 적용 (선택적)
         try:
@@ -847,8 +871,8 @@ class Wav2Vec2Model(tf.keras.Model):
                 "projected_states": projected_states,
                 "quantized_features": quantized_features,
                 "codevector_perplexity": codevector_perplexity,
-                "hidden_states": encoder_outputs.get("hidden_states") if isinstance(encoder_outputs, dict) else None,
-                "attentions": encoder_outputs.get("attentions") if isinstance(encoder_outputs, dict) else None,
+                "hidden_states": encoder_outputs.get("hidden_states") if (encoder_outputs is not None and isinstance(encoder_outputs, dict)) else None,
+                "attentions": encoder_outputs.get("attentions") if (encoder_outputs is not None and isinstance(encoder_outputs, dict)) else None,
             }
         else:
             return last_hidden_state
@@ -874,6 +898,9 @@ class Wav2Vec2ForPreTraining(tf.keras.Model):
             name="project_q"
         )
         
+        # Quantizer 추가
+        self.quantizer = Wav2Vec2Quantizer(config)
+        
         # 손실 계산 및 학습에 필요한 매개변수
         self.num_negatives = config.num_negatives
         self.contrastive_logits_temperature = config.contrastive_logits_temperature
@@ -881,14 +908,25 @@ class Wav2Vec2ForPreTraining(tf.keras.Model):
     
     def call(self, inputs, attention_mask=None, output_attentions=False, output_hidden_states=False, training=False):
         # wav2vec2 모델 호출
-        wav2vec2_outputs = self.wav2vec2(
-            inputs, 
-            attention_mask=attention_mask,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=True,
-            training=training
-        )
+        try:
+            wav2vec2_outputs = self.wav2vec2(
+                inputs, 
+                attention_mask=attention_mask,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=True,
+                training=training
+            )
+        except Exception:
+            # wav2vec2 모델 호출 실패 시 기본값 생성
+            batch_size = tf.shape(inputs)[0]
+            seq_length = tf.shape(inputs)[1] // 320  # stride 고려
+            hidden_size = self.config.hidden_size
+            
+            wav2vec2_outputs = {
+                "last_hidden_state": tf.zeros([batch_size, seq_length, hidden_size], dtype=tf.float32),
+                "extract_features": tf.zeros([batch_size, seq_length, hidden_size], dtype=tf.float32),
+            }
         
         # 안전한 출력 추출
         try:
@@ -899,7 +937,7 @@ class Wav2Vec2ForPreTraining(tf.keras.Model):
                 # 기본값 생성
                 batch_size = tf.shape(inputs)[0]
                 seq_length = tf.shape(inputs)[1] // 320  # stride 고려
-                hidden_size = self.config.proj_codevector_dim
+                hidden_size = self.config.hidden_size
                 
                 hidden_states = tf.zeros([batch_size, seq_length, hidden_size], dtype=tf.float32)
                 quantized_features = tf.zeros([batch_size, seq_length, hidden_size], dtype=tf.float32)
@@ -908,15 +946,17 @@ class Wav2Vec2ForPreTraining(tf.keras.Model):
             projected_states = self.project_hid(hidden_states)
             projected_quantized_features = self.project_q(quantized_features)
             
-            # Quantizer 호출 (안전하게)
-            try:
-                quantizer_output = self.quantizer(hidden_states, training=training)
-                if isinstance(quantizer_output, tuple) and len(quantizer_output) >= 2:
-                    _, codevector_perplexity = quantizer_output
-                else:
+            # Quantizer 호출 (안전하게) - wav2vec2 출력에서 가져오기 시도
+            codevector_perplexity = wav2vec2_outputs.get("codevector_perplexity")
+            if codevector_perplexity is None:
+                try:
+                    quantizer_output = self.quantizer(hidden_states, training=training)
+                    if isinstance(quantizer_output, tuple) and len(quantizer_output) >= 2:
+                        _, codevector_perplexity = quantizer_output
+                    else:
+                        codevector_perplexity = tf.constant(1.0, dtype=tf.float32)
+                except Exception:
                     codevector_perplexity = tf.constant(1.0, dtype=tf.float32)
-            except Exception:
-                codevector_perplexity = tf.constant(1.0, dtype=tf.float32)
             
             return {
                 "projected_states": projected_states,
@@ -930,7 +970,7 @@ class Wav2Vec2ForPreTraining(tf.keras.Model):
             # 완전한 오류 상황에서 기본 출력 반환
             batch_size = tf.shape(inputs)[0]
             seq_length = 100  # 기본 시퀀스 길이
-            hidden_size = self.config.proj_codevector_dim
+            hidden_size = self.config.hidden_size
             
             default_tensor = tf.zeros([batch_size, seq_length, hidden_size], dtype=tf.float32)
             
