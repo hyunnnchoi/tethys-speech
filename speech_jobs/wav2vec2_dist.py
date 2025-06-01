@@ -1397,9 +1397,11 @@ def main(strategy, model_size):
         try:
             for gpu in gpus:
                 tf.config.experimental.set_memory_growth(gpu, True)
+            print("GPU 메모리 증가 옵션 설정 완료")
         except RuntimeError as e:
-            print(f"GPU 메모리 설정 오류: {e}")
-    
+            # 이미 초기화된 경우 무시
+            print(f"GPU 메모리 설정 중 오류 (무시 가능): {e}")
+
     # 네트워크 및 GPU 모니터링 시작
     os.system('sh /workspace/network.sh &')  # network profile
     os.system('sh /workspace/gpu.sh &')  # gpu profile
@@ -1461,7 +1463,7 @@ if __name__ == "__main__":
 
     # 분산 학습 전략 설정 - 안정성 개선
     os.environ['GRPC_VERBOSITY'] = 'ERROR'
-    os.environ['TF_GRPC_DEFAULT_OPTIONS'] = 'grpc.keepalive_time_ms=30000,grpc.keepalive_timeout_ms=5000,grpc.keepalive_permit_without_calls=true,grpc.http2.max_pings_without_data=0,grpc.http2.min_time_between_pings_ms=10000,grpc.http2.min_ping_interval_without_data_ms=300000'
+    os.environ['TF_GRPC_DEFAULT_OPTIONS'] = 'grpc.keepalive_time_ms=30000,grpc.keepalive_timeout_ms=5000,grpc.keepalive_permit_without_calls=1,grpc.http2.max_pings_without_data=0,grpc.http2.min_time_between_pings_ms=10000,grpc.http2.min_ping_interval_without_data_ms=300000'
     os.environ['TF_COLLECTIVE_OP_TIMEOUT'] = '120'
     
     # 통신 옵션으로 안정성 향상
