@@ -1211,98 +1211,65 @@ def create_full_model(model_type="pretraining",
 
 
 # 분산 학습 스텝 정의 (수정됨)
-def distributed_train_step(strategy, model, dist_inputs, optimizer):
+def distributed_train_step(strategy, model, dist_inputs, optimizer, task_type, step_num):
     """개선된 분산 학습 스텝"""
+
+    # train_step 함수 내부에서 직접 psutil 호출은 tf.function 컨텍스트 문제로 어려울 수 있음
+    # 대신 distributed_train_step 함수 호출 시점에서 로깅 (아래 train_wav2vec2 루프에서 수행)
     
     def train_step(inputs):
         features, labels = inputs
-        
-        # 배치 크기 검증
         batch_size = tf.shape(features)[0]
-        
-        # 빈 배치인 경우 0 손실 반환
+
         def empty_batch_fn():
             return tf.constant(0.0, dtype=tf.float32)
         
         def normal_batch_fn():
             with tf.GradientTape() as tape:
-                # 모델 순전파
                 outputs = model(features, training=True)
-                
-                # 손실 계산
                 if isinstance(model, Wav2Vec2ForPreTraining):
                     if "projected_states" in outputs and "projected_quantized_features" in outputs:
-                        # 컨트라스트 손실 계산
-                        logits, contrastive_loss = model._compute_contrastive_loss(
+                        _, contrastive_loss = model._compute_contrastive_loss(
                             outputs["projected_states"],
                             outputs["projected_quantized_features"]
                         )
-                        
-                        # 다양성 손실 추가
-                        if "codevector_perplexity" in outputs:
-                            diversity_loss = model._compute_diversity_loss(outputs["codevector_perplexity"])
-                        else:
-                            diversity_loss = tf.constant(0.0)
-                        
-                        # 최종 손실
+                        diversity_loss = model._compute_diversity_loss(outputs.get("codevector_perplexity", tf.constant(0.0)))
                         loss = contrastive_loss + model.diversity_loss_weight * diversity_loss
                     else:
                         loss = tf.constant(0.0)
                 else:
-                    outputs = model(features, labels=labels, training=True)
-                    loss = outputs.get("loss", 0.0)
+                    # ASR이나 Classification의 경우 labels를 전달해야 할 수 있음 (현재 더미 데이터는 labels 사용 안함)
+                    # outputs = model(features, labels=labels, training=True) 
+                    outputs = model(features, training=True) # Wav2Vec2Model은 labels 안 받음
+                    loss = outputs.get("loss", tf.constant(0.0)) # 모델이 loss를 반환한다고 가정
                 
-                # NaN 체크
                 loss = tf.where(tf.math.is_nan(loss), tf.constant(0.0), loss)
-                
-                # 분산 환경에서 손실 정규화
                 scaled_loss = loss / tf.cast(strategy.num_replicas_in_sync, tf.float32)
             
-            # 그래디언트 계산
             gradients = tape.gradient(scaled_loss, model.trainable_variables)
-            
-            # None 그래디언트 필터링
             gradients = [
                 tf.zeros_like(var) if grad is None else grad 
                 for grad, var in zip(gradients, model.trainable_variables)
             ]
-            
-            # 그래디언트 클리핑
             gradients, _ = tf.clip_by_global_norm(gradients, 1.0)
-            
-            # 옵티마이저 적용
             optimizer.apply_gradients(zip(gradients, model.trainable_variables))
-            
             return scaled_loss
         
-        return tf.cond(
-            tf.equal(batch_size, 0),
-            empty_batch_fn,
-            normal_batch_fn
-        )
+        return tf.cond(tf.equal(batch_size, 0), empty_batch_fn, normal_batch_fn)
     
-    # 분산 전략으로 실행
     per_replica_losses = strategy.run(train_step, args=(dist_inputs,))
-    
-    # 손실 집계
     return strategy.reduce(tf.distribute.ReduceOp.SUM, per_replica_losses, axis=None)
 
 # wav2vec2 모델 메인 학습 함수 (수정됨)
 def train_wav2vec2(strategy, task_type, model_type="pretraining", model_size="small", num_epochs=1, learning_rate=3e-5):
-    """수정된 wav2vec2 모델 학습 함수"""
-    
+    if task_type == 'chief':
+        print("--- train_wav2vec2 시작 전 리소스 상태 ---")
+        log_system_resources()
+
     with strategy.scope():
-        # 모델 생성
         model = create_full_model(model_type=model_type, model_size=model_size)
-        
-        # 옵티마이저 설정
         optimizer = tf.keras.optimizers.Adam(
-            learning_rate=learning_rate,
-            epsilon=1e-8,
-            clipnorm=1.0
-        )
-        
-        # 메트릭 설정
+            learning_rate=learning_rate, epsilon=1e-8, clipnorm=1.0)
         metrics = []
         if model_type == "pretraining":
             metrics.extend([
@@ -1317,79 +1284,66 @@ def train_wav2vec2(strategy, task_type, model_type="pretraining", model_size="sm
                 tf.keras.metrics.SparseCategoricalAccuracy(name="accuracy"),
                 tf.keras.metrics.Mean(name="loss")
             ])
-        
-        # 모델 컴파일
         model.compile(optimizer=optimizer, metrics=metrics)
 
-    # 데이터셋 생성
     train_dataset = create_dummy_dataset(GLOBAL_BATCH_SIZE)
-    
-    # 데이터셋 샤딩 정책 설정 (TensorFlow 경고에 따름)
     options = tf.data.Options()
     options.experimental_distribute.auto_shard_policy = tf.data.experimental.AutoShardPolicy.DATA
     train_dataset = train_dataset.with_options(options)
-    
     dist_dataset = strategy.experimental_distribute_dataset(train_dataset)
     
-    # 체크포인트 설정
     checkpoint_dir = '/workspace/checkpoints'
     os.makedirs(checkpoint_dir, exist_ok=True)
     checkpoint = tf.train.Checkpoint(model=model, optimizer=optimizer)
-    
-    # 학습 루프
+
     step = 0
     iterator = iter(dist_dataset)
-    
-    # 시작 시간 기록
     start_time = time.time()
     
     for epoch in range(num_epochs):
         if task_type == 'chief':
-             print(f"Epoch {epoch+1}/{num_epochs}")
+            print(f"Epoch {epoch+1}/{num_epochs}")
         
-        for _ in range(MAX_ITERATIONS):
+        for i in range(MAX_ITERATIONS):
+            if task_type == 'chief' and i % 5 == 0: # 5 스텝마다 distributed_train_step 호출 전 로깅
+                print(f"--- distributed_train_step 호출 전 (Epoch: {epoch+1}, Iter: {i}, Global Step: {step}) --- ")
+                log_system_resources()
+
             try:
                 inputs = next(iterator)
                 step_start = time.time()
-                loss = distributed_train_step(strategy, model, inputs, optimizer)
+                loss = distributed_train_step(strategy, model, inputs, optimizer, task_type, step)
                 step_end = time.time()
                 step_duration = step_end - step_start
                 elapsed = step_end - start_time
                 
                 if task_type == 'chief':
-                    try:
-                        loss_value = float(loss)
-                    except:
-                        loss_value = 0.0
+                    try: loss_value = float(loss)
+                    except: loss_value = 0.0
                     print(f"Step {step}, Loss: {loss_value:.4f}, Time: {time.strftime('%H:%M:%S')} (경과: {elapsed:.2f}초, 스텝 시간: {step_duration:.2f}초)")
                     if step % 1 == 0: 
                         log_system_resources()
                 
                 step += 1
-                
                 if task_type == 'chief' and step % 50 == 0:
                     checkpoint.save(os.path.join(checkpoint_dir, f"model_step_{step}"))
-                
             except StopIteration:
                 iterator = iter(dist_dataset)
                 inputs = next(iterator)
                 step_start = time.time()
-                loss = distributed_train_step(strategy, model, inputs, optimizer)
+                loss = distributed_train_step(strategy, model, inputs, optimizer, task_type, step)
                 step_end = time.time()
                 step_duration = step_end - step_start
                 elapsed = step_end - start_time
                 
                 if task_type == 'chief':
-                    try:
-                        loss_value = float(loss)
-                    except:
-                        loss_value = 0.0
+                    try: loss_value = float(loss)
+                    except: loss_value = 0.0
                     print(f"Step {step}, Loss: {loss_value:.4f}, Time: {time.strftime('%H:%M:%S')} (경과: {elapsed:.2f}초, 스텝 시간: {step_duration:.2f}초)")
                     if step % 1 == 0: 
                         log_system_resources()
                 
                 step += 1
-                
             except Exception as e:
                 if task_type == 'chief':
                     print(f"Error at step {step}: {e}")
@@ -1399,7 +1353,12 @@ def train_wav2vec2(strategy, task_type, model_type="pretraining", model_size="sm
         
         if task_type == 'chief':
             checkpoint.save(os.path.join(checkpoint_dir, f"model_epoch_{epoch+1}"))
+            print("--- train_wav2vec2 중간 리소스 상태 (에포크 종료) ---")
+            log_system_resources()
     
+    if task_type == 'chief':
+        print("--- train_wav2vec2 종료 직후 리소스 상태 ---")
+        log_system_resources()
     return model
 
 
