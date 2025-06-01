@@ -797,33 +797,45 @@ class Wav2Vec2ForPreTraining(tf.keras.Model):
     
     @tf.function  
     def _sample_negative_indices(self, sequence_length, batch_size):
-        """안전한 negative sampling"""
+        """안전한 negative sampling - tf.function 호환"""
         # sequence_length가 num_negatives보다 작은 경우 처리
         actual_negatives = tf.minimum(self.num_negatives, sequence_length - 1)
+        actual_negatives = tf.maximum(actual_negatives, 1)  # 최소 1개는 보장
         
-        # 인덱스 범위 생성
+        # 모든 배치에 대해 한번에 처리
+        # [batch_size, sequence_length] 형태의 인덱스 행렬 생성
         indices_range = tf.range(sequence_length)
         
-        # 각 배치에 대해 셔플된 인덱스 생성
-        neg_indices_list = []
+        # 배치별로 독립적인 셔플 생성
+        batch_indices = tf.TensorArray(tf.int32, size=batch_size)
         
-        for _ in range(batch_size):
+        for i in tf.range(batch_size):
+            # 각 배치마다 셔플된 인덱스 생성
             shuffled = tf.random.shuffle(indices_range)
-            # 필요한 만큼만 선택
-            selected = shuffled[:actual_negatives]
-            # 부족한 경우 반복하여 채움
-            if actual_negatives < self.num_negatives:
-                repeats = tf.math.ceil(self.num_negatives / actual_negatives)
-                repeated = tf.tile(selected, [tf.cast(repeats, tf.int32)])
-                selected = repeated[:self.num_negatives]
             
-            neg_indices_list.append(selected)
+            # 필요한 개수만큼 선택 및 반복
+            if actual_negatives <= sequence_length:
+                selected = shuffled[:actual_negatives]
+            else:
+                # 부족한 경우 순환적으로 반복
+                repeats_needed = tf.math.ceil(tf.cast(actual_negatives, tf.float32) / tf.cast(sequence_length, tf.float32))
+                repeated = tf.tile(shuffled, [tf.cast(repeats_needed, tf.int32)])
+                selected = repeated[:actual_negatives]
+            
+            # num_negatives 크기에 맞춰 패딩 또는 자르기
+            if tf.shape(selected)[0] < self.num_negatives:
+                padding_size = self.num_negatives - tf.shape(selected)[0]
+                padding = tf.tile(selected[-1:], [padding_size])  # 마지막 값으로 패딩
+                selected = tf.concat([selected, padding], axis=0)
+            else:
+                selected = selected[:self.num_negatives]
+            
+            batch_indices = batch_indices.write(i, selected)
         
         # [batch_size, num_negatives] 형태로 스택
-        neg_indices = tf.stack(neg_indices_list, axis=0)
+        neg_indices = batch_indices.stack()
         
         # [batch_size, sequence_length, num_negatives] 형태로 확장
-        # 각 시간 스텝에 대해 동일한 negative 인덱스 사용
         neg_indices = tf.tile(tf.expand_dims(neg_indices, axis=1), [1, sequence_length, 1])
         
         return neg_indices
@@ -1028,6 +1040,255 @@ class Wav2Vec2ForSequenceClassification(tf.keras.Model):
         return results
 
 
+# ============ 텐서 사이즈 측정 유틸리티 ============ #
+
+class TensorSizeTracker:
+    """텐서 사이즈 측정 및 통계 클래스"""
+    
+    def __init__(self):
+        self.tensor_sizes = []
+        self.operation_counts = {}
+        self.total_elements = 0
+        self.total_memory_mb = 0.0
+        
+    def reset(self):
+        """측정 데이터 초기화"""
+        self.tensor_sizes.clear()
+        self.operation_counts.clear()
+        self.total_elements = 0
+        self.total_memory_mb = 0.0
+    
+    def track_tensor(self, tensor, operation_name="unknown"):
+        """개별 텐서 크기 추적"""
+        if tensor is not None:
+            # 텐서의 요소 개수 계산
+            num_elements = tf.size(tensor).numpy()
+            
+            # 메모리 사용량 계산 (float32 기준: 4 bytes per element)
+            memory_bytes = num_elements * 4  # float32
+            memory_mb = memory_bytes / (1024 * 1024)
+            
+            # 통계 업데이트
+            self.tensor_sizes.append({
+                'operation': operation_name,
+                'shape': tensor.shape.as_list(),
+                'elements': num_elements,
+                'memory_mb': memory_mb
+            })
+            
+            self.total_elements += num_elements
+            self.total_memory_mb += memory_mb
+            
+            # 연산 타입별 카운트
+            if operation_name in self.operation_counts:
+                self.operation_counts[operation_name] += 1
+            else:
+                self.operation_counts[operation_name] = 1
+    
+    def track_layer_outputs(self, layer, inputs, layer_name=""):
+        """레이어의 모든 출력 텐서 추적"""
+        try:
+            outputs = layer(inputs, training=True)
+            
+            if isinstance(outputs, (list, tuple)):
+                for i, output in enumerate(outputs):
+                    self.track_tensor(output, f"{layer_name}_output_{i}")
+            elif isinstance(outputs, dict):
+                for key, output in outputs.items():
+                    if isinstance(output, tf.Tensor):
+                        self.track_tensor(output, f"{layer_name}_{key}")
+            else:
+                self.track_tensor(outputs, f"{layer_name}_output")
+                
+        except Exception as e:
+            print(f"Error tracking layer {layer_name}: {e}")
+    
+    def get_summary(self):
+        """측정 결과 요약 반환"""
+        return {
+            'total_tensors': len(self.tensor_sizes),
+            'total_elements': self.total_elements,
+            'total_memory_mb': self.total_memory_mb,
+            'operation_counts': self.operation_counts,
+            'detailed_tensors': self.tensor_sizes
+        }
+    
+    def print_summary(self, top_n=10):
+        """측정 결과 출력"""
+        print("\n" + "="*60)
+        print("TENSOR SIZE MEASUREMENT SUMMARY")
+        print("="*60)
+        print(f"Total Tensors Created: {len(self.tensor_sizes)}")
+        print(f"Total Elements: {self.total_elements:,}")
+        print(f"Total Memory Usage: {self.total_memory_mb:.2f} MB")
+        print(f"Average Tensor Size: {self.total_elements / max(len(self.tensor_sizes), 1):,.0f} elements")
+        
+        print(f"\nOperation Counts:")
+        for op, count in sorted(self.operation_counts.items(), key=lambda x: x[1], reverse=True):
+            print(f"  {op}: {count}")
+        
+        print(f"\nTop {top_n} Largest Tensors:")
+        sorted_tensors = sorted(self.tensor_sizes, key=lambda x: x['elements'], reverse=True)
+        for i, tensor_info in enumerate(sorted_tensors[:top_n]):
+            print(f"  {i+1}. {tensor_info['operation']}: {tensor_info['shape']} "
+                  f"({tensor_info['elements']:,} elements, {tensor_info['memory_mb']:.2f} MB)")
+        print("="*60)
+
+
+def measure_model_tensor_sizes(model, sample_input):
+    """모델 전체의 텐서 사이즈 측정"""
+    tracker = TensorSizeTracker()
+    
+    # 입력 텐서 추적
+    tracker.track_tensor(sample_input, "input")
+    
+    # 모델이 Wav2Vec2ForPreTraining인 경우
+    if isinstance(model, Wav2Vec2ForPreTraining):
+        # Feature Extractor 측정
+        with tf.GradientTape() as tape:
+            tape.watch(sample_input)
+            
+            # 1. Feature Extraction
+            extract_features = model.wav2vec2.feature_extractor(sample_input, training=True)
+            tracker.track_tensor(extract_features, "feature_extractor_output")
+            
+            # 2. Feature Projection
+            projected_features = model.wav2vec2.feature_projection(extract_features)
+            tracker.track_tensor(projected_features, "feature_projection")
+            
+            projected_features = model.wav2vec2.feature_projection_layer_norm(projected_features)
+            tracker.track_tensor(projected_features, "feature_projection_norm")
+            
+            projected_features = model.wav2vec2.feature_projection_dropout(projected_features, training=True)
+            tracker.track_tensor(projected_features, "feature_projection_dropout")
+            
+            # 3. Quantizer
+            quantized_result = model.wav2vec2.quantizer(projected_features, training=True)
+            if isinstance(quantized_result, dict):
+                for key, value in quantized_result.items():
+                    if isinstance(value, tf.Tensor):
+                        tracker.track_tensor(value, f"quantizer_{key}")
+            
+            # 4. Encoder Layers
+            hidden_states = projected_features
+            for i, layer in enumerate(model.wav2vec2.encoder.layers):
+                # Self-Attention
+                if hasattr(layer, 'attention'):
+                    attention_outputs = layer.attention(hidden_states, training=True)
+                    if isinstance(attention_outputs, (list, tuple)):
+                        for j, output in enumerate(attention_outputs):
+                            tracker.track_tensor(output, f"layer_{i}_attention_output_{j}")
+                    else:
+                        tracker.track_tensor(attention_outputs, f"layer_{i}_attention_output")
+                
+                # Full layer output
+                layer_outputs = layer(hidden_states, training=True)
+                if isinstance(layer_outputs, (list, tuple)):
+                    hidden_states = layer_outputs[0]
+                    tracker.track_tensor(hidden_states, f"layer_{i}_output")
+                else:
+                    hidden_states = layer_outputs
+                    tracker.track_tensor(hidden_states, f"layer_{i}_output")
+            
+            # 5. Projection Heads
+            projected_hidden = model.wav2vec2.project_hid(hidden_states)
+            tracker.track_tensor(projected_hidden, "project_hid_output")
+            
+            if "quantized_features" in quantized_result:
+                projected_quantized = model.wav2vec2.project_q(quantized_result["quantized_features"])
+                tracker.track_tensor(projected_quantized, "project_q_output")
+            
+            # 6. Loss Computation Tensors
+            if "quantized_features" in quantized_result:
+                # Contrastive loss intermediate tensors
+                logits, contrastive_loss = model._compute_contrastive_loss(
+                    projected_hidden, projected_quantized
+                )
+                tracker.track_tensor(logits, "contrastive_logits")
+                tracker.track_tensor(contrastive_loss, "contrastive_loss")
+                
+                # Diversity loss
+                diversity_loss = model._compute_diversity_loss(quantized_result["codevector_perplexity"])
+                tracker.track_tensor(diversity_loss, "diversity_loss")
+        
+        # 7. Gradient Tensors
+        total_loss = contrastive_loss + model.diversity_loss_weight * diversity_loss
+        gradients = tape.gradient(total_loss, model.trainable_variables)
+        
+        for i, grad in enumerate(gradients):
+            if grad is not None:
+                tracker.track_tensor(grad, f"gradient_{i}")
+    
+    # 다른 모델 타입들도 처리
+    elif isinstance(model, Wav2Vec2ForCTC):
+        with tf.GradientTape() as tape:
+            outputs = model(sample_input, training=True)
+            for key, value in outputs.items():
+                if isinstance(value, tf.Tensor):
+                    tracker.track_tensor(value, f"ctc_{key}")
+    
+    elif isinstance(model, Wav2Vec2ForSequenceClassification):
+        with tf.GradientTape() as tape:
+            outputs = model(sample_input, training=True)
+            for key, value in outputs.items():
+                if isinstance(value, tf.Tensor):
+                    tracker.track_tensor(value, f"classification_{key}")
+    
+    return tracker
+
+
+def measure_iteration_tensor_sizes(model, sample_batch):
+    """한 번의 학습 iteration에서 생성되는 모든 텐서 크기 측정"""
+    tracker = TensorSizeTracker()
+    
+    # 입력 배치 추적
+    features, labels = sample_batch
+    tracker.track_tensor(features, "batch_features")
+    tracker.track_tensor(labels, "batch_labels")
+    
+    # Forward pass 중 모든 텐서 추적
+    with tf.GradientTape() as tape:
+        tape.watch(features)
+        
+        # 모델 순전파 및 텐서 추적
+        if isinstance(model, Wav2Vec2ForPreTraining):
+            outputs = model(features, training=True)
+            
+            # 모든 출력 텐서 추적
+            for key, value in outputs.items():
+                if isinstance(value, tf.Tensor):
+                    tracker.track_tensor(value, f"model_output_{key}")
+            
+            # 손실 계산 텐서들
+            if "projected_states" in outputs and "projected_quantized_features" in outputs:
+                logits, contrastive_loss = model._compute_contrastive_loss(
+                    outputs["projected_states"],
+                    outputs["projected_quantized_features"]
+                )
+                tracker.track_tensor(logits, "loss_logits")
+                tracker.track_tensor(contrastive_loss, "contrastive_loss_tensor")
+                
+                if "codevector_perplexity" in outputs:
+                    diversity_loss = model._compute_diversity_loss(outputs["codevector_perplexity"])
+                    tracker.track_tensor(diversity_loss, "diversity_loss_tensor")
+                    
+                    total_loss = contrastive_loss + model.diversity_loss_weight * diversity_loss
+                    tracker.track_tensor(total_loss, "total_loss")
+        else:
+            outputs = model(features, labels=labels, training=True)
+            total_loss = outputs.get("loss", tf.constant(0.0))
+            tracker.track_tensor(total_loss, "total_loss")
+    
+    # Gradient 계산 및 추적
+    gradients = tape.gradient(total_loss, model.trainable_variables)
+    for i, (grad, var) in enumerate(zip(gradients, model.trainable_variables)):
+        if grad is not None:
+            tracker.track_tensor(grad, f"gradient_var_{i}")
+            tracker.track_tensor(var, f"model_variable_{i}")
+    
+    return tracker
+
+
 # ============ 유틸리티 함수 및 학습 관련 코드 ============ #
 
 # 시간 마스킹 적용 함수
@@ -1142,10 +1403,10 @@ def create_full_model(model_type="pretraining",
         return Wav2Vec2Model(config)
 
 
-# 분산 학습 스텝 정의 (수정됨)
+# 분산 학습 스텝 정의 (텐서 사이즈 측정 포함)
 @tf.function
-def distributed_train_step(strategy, model, dist_inputs, optimizer):
-    """개선된 분산 학습 스텝"""
+def distributed_train_step_with_measurement(strategy, model, dist_inputs, optimizer, measure_tensors=False):
+    """텐서 사이즈 측정 기능이 포함된 분산 학습 스텝"""
     
     def train_step(inputs):
         features, labels = inputs
@@ -1213,9 +1474,16 @@ def distributed_train_step(strategy, model, dist_inputs, optimizer):
     # 손실 집계
     return strategy.reduce(tf.distribute.ReduceOp.SUM, per_replica_losses, axis=None)
 
-# wav2vec2 모델 메인 학습 함수 (수정됨)
-def train_wav2vec2(strategy, model_type="pretraining", num_epochs=1, learning_rate=3e-5):
-    """수정된 wav2vec2 모델 학습 함수"""
+
+# 기존 distributed_train_step 함수 유지 (호환성을 위해)
+@tf.function
+def distributed_train_step(strategy, model, dist_inputs, optimizer):
+    """개선된 분산 학습 스텝"""
+    return distributed_train_step_with_measurement(strategy, model, dist_inputs, optimizer, measure_tensors=False)
+
+# wav2vec2 모델 메인 학습 함수 (텐서 사이즈 측정 포함)
+def train_wav2vec2(strategy, model_type="pretraining", num_epochs=1, learning_rate=3e-5, measure_tensors=True):
+    """텐서 사이즈 측정 기능이 포함된 wav2vec2 모델 학습 함수"""
     
     with strategy.scope():
         # 모델 생성
@@ -1256,9 +1524,78 @@ def train_wav2vec2(strategy, model_type="pretraining", num_epochs=1, learning_ra
     os.makedirs(checkpoint_dir, exist_ok=True)
     checkpoint = tf.train.Checkpoint(model=model, optimizer=optimizer)
     
+    # 텐서 사이즈 측정 준비
+    if measure_tensors:
+        # 첫 번째 배치로 샘플 텐서 사이즈 측정
+        sample_iterator = iter(dist_dataset)
+        sample_batch = next(sample_iterator)
+        
+        print("\n" + "="*60)
+        print("MEASURING TENSOR SIZES FOR ONE ITERATION...")
+        print("="*60)
+        
+        # 각 replica에서 텐서 사이즈 측정
+        def measure_on_replica(sample_inputs):
+            features, labels = sample_inputs
+            # 단일 샘플로 측정 (배치의 첫 번째 요소)
+            single_sample = features[0:1]  # 배치 크기 1로 만들기
+            return measure_iteration_tensor_sizes(model, (single_sample, labels[0:1]))
+        
+        # 한 replica에서만 측정 (모든 replica에서 동일할 것임)
+        replica_trackers = strategy.run(measure_on_replica, args=(sample_batch,))
+        
+        # 첫 번째 replica의 결과만 사용
+        if hasattr(replica_trackers, 'values'):
+            tracker = replica_trackers.values[0]
+        else:
+            tracker = replica_trackers
+        
+        # 결과 출력
+        tracker.print_summary()
+        
+        # 텐서 사이즈 결과를 파일로 저장
+        try:
+            summary = tracker.get_summary()
+            
+            # 결과 저장 경로
+            result_dir = '/result'
+            if os.path.exists('/workspace/model.txt'):
+                with open('/workspace/model.txt', 'r') as f:
+                    save_dir_name = f.read().strip()
+                    result_dir = f'/result/{save_dir_name}'
+            
+            os.makedirs(result_dir, exist_ok=True)
+            
+            # 상세 결과를 JSON으로 저장
+            import json
+            tensor_size_file = os.path.join(result_dir, f'{task_type}_{task_index}_tensor_sizes.json')
+            with open(tensor_size_file, 'w') as f:
+                json.dump(summary, f, indent=2, default=str)
+            
+            # 요약 결과를 텍스트로 저장
+            summary_file = os.path.join(result_dir, f'{task_type}_{task_index}_tensor_summary.txt')
+            with open(summary_file, 'w') as f:
+                f.write(f"Total Tensors: {summary['total_tensors']}\n")
+                f.write(f"Total Elements: {summary['total_elements']}\n")
+                f.write(f"Total Memory (MB): {summary['total_memory_mb']:.2f}\n")
+                f.write(f"Average Tensor Size: {summary['total_elements'] / max(summary['total_tensors'], 1):.0f} elements\n")
+                
+                f.write("\nOperation Counts:\n")
+                for op, count in sorted(summary['operation_counts'].items(), key=lambda x: x[1], reverse=True):
+                    f.write(f"  {op}: {count}\n")
+            
+            print(f"Tensor size results saved to {result_dir}")
+            
+        except Exception as e:
+            print(f"Error saving tensor size results: {e}")
+        
+        # 측정용 iterator는 새로 생성
+        iterator = iter(dist_dataset)
+    else:
+        iterator = iter(dist_dataset)
+    
     # 학습 루프
     step = 0
-    iterator = iter(dist_dataset)
     
     # 시작 시간 기록
     start_time = time.time()
@@ -1278,6 +1615,48 @@ def train_wav2vec2(strategy, model_type="pretraining", num_epochs=1, learning_ra
                 loss = distributed_train_step(strategy, model, inputs, optimizer)
                 
                 # 스텝 완료 시간
+                step_end = time.time()
+                step_duration = step_end - step_start
+                elapsed = step_end - start_time
+                
+                # 모든 스텝에 대해 타임스탬프와 함께 로깅
+                print(f"Step {step}, Loss: {loss.numpy():.4f}, Time: {time.strftime('%H:%M:%S')} (경과: {elapsed:.2f}초, 스텝 시간: {step_duration:.2f}초)")
+                
+                step += 1
+                
+                # 주기적 체크포인트 저장
+                if step % 50 == 0:
+                    checkpoint.save(os.path.join(checkpoint_dir, f"model_step_{step}"))
+                
+            except StopIteration:
+                iterator = iter(dist_dataset)
+                inputs = next(iterator)
+                
+                # 현재 시간 기록
+                step_start = time.time()
+                
+                # 분산 학습 스텝 실행
+                loss = distributed_train_step(strategy, model, inputs, optimizer)
+                
+                # 스텝 완료 시간
+                step_end = time.time()
+                step_duration = step_end - step_start
+                elapsed = step_end - start_time
+                
+                print(f"Step {step}, Loss: {loss.numpy():.4f}, Time: {time.strftime('%H:%M:%S')} (경과: {elapsed:.2f}초, 스텝 시간: {step_duration:.2f}초)")
+                
+                step += 1
+                
+            except Exception as e:
+                print(f"Error at step {step}: {e}")
+                # 에러 발생 시 데이터셋 재시작
+                iterator = iter(dist_dataset)
+                continue
+        
+        # 에포크 종료 후 체크포인트 저장
+        checkpoint.save(os.path.join(checkpoint_dir, f"model_epoch_{epoch+1}"))
+    
+    return model텝 완료 시간
                 step_end = time.time()
                 step_duration = step_end - step_start
                 elapsed = step_end - start_time
