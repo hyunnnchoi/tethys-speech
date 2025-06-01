@@ -1391,7 +1391,7 @@ def main(strategy, model_size):
     
     print("16GB V100 GPU에 최적화된 설정")
     
-    # 메모리 최적화 설정
+    # !!!! 메모리 설정을 가장 먼저 수행 !!!!
     gpus = tf.config.experimental.list_physical_devices('GPU')
     if gpus:
         try:
@@ -1401,6 +1401,43 @@ def main(strategy, model_size):
         except RuntimeError as e:
             # 이미 초기화된 경우 무시
             print(f"GPU 메모리 설정 중 오류 (무시 가능): {e}")
+
+    # 분산 학습 전략 설정 - 안정성 개선
+    os.environ['GRPC_VERBOSITY'] = 'ERROR'
+    os.environ['TF_GRPC_DEFAULT_OPTIONS'] = 'grpc.keepalive_time_ms=30000,grpc.keepalive_timeout_ms=5000,grpc.keepalive_permit_without_calls=1,grpc.http2.max_pings_without_data=0,grpc.http2.min_time_between_pings_ms=10000,grpc.http2.min_ping_interval_without_data_ms=300000'
+    os.environ['TF_COLLECTIVE_OP_TIMEOUT'] = '1200'  # 600 -> 1200초 (20분)
+    
+    # 추가 안정성 설정
+    os.environ['TF_GRPC_WORKER_CACHE_ENABLED'] = '0'  # Worker 캐시 비활성화
+    os.environ['TF_COORDINATOR_TIMEOUT_SECONDS'] = '1200'  # 600 -> 1200초
+    os.environ['TF_ENABLE_EAGER_CLIENT_STREAMING_ENQUEUE'] = '0'  # 스트리밍 최적화 비활성화
+    os.environ['GRPC_MAX_CONNECTION_IDLE_MS'] = '60000'  # 30초 -> 60초
+    os.environ['GRPC_MAX_CONNECTION_AGE_MS'] = '600000'  # 5분 -> 10분
+    
+    # CoreDNS 관련 안정성 설정
+    os.environ['GRPC_DNS_RESOLVER'] = 'native'  # DNS 해석기 설정
+    os.environ['GRPC_POLL_STRATEGY'] = 'poll'  # 폴링 전략 설정
+    
+    # 2-노드 환경 특정 안정성 설정  
+    os.environ['NCCL_DEBUG'] = 'WARN'  # NCCL 디버그 정보
+    os.environ['NCCL_ALGO'] = 'Ring'  # NCCL 알고리즘을 Ring으로 강제
+    os.environ['NCCL_TREE_THRESHOLD'] = '0'  # Tree 알고리즘 비활성화
+    os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'  # GPU 메모리 점진적 증가 강제
+    os.environ['TF_GPU_THREAD_MODE'] = 'gpu_private'  # GPU 스레드 모드
+    
+    # 동기화 강화 설정
+    os.environ['TF_ENABLE_AUTO_MIXED_PRECISION'] = '0'  # 혼합 정밀도 비활성화
+    os.environ['TF_SYNC_ON_FINISH'] = '1'  # 작업 완료 시 동기화 강제
+    
+    # 통신 옵션으로 안정성 향상
+    communication_options = tf.distribute.experimental.CommunicationOptions(
+        implementation=tf.distribute.experimental.CommunicationImplementation.RING,  # NCCL -> RING으로 변경
+        timeout_seconds=1200.0  # 600초 -> 1200초 (20분)
+    )
+    
+    strategy = tf.distribute.MultiWorkerMirroredStrategy(
+        communication_options=communication_options
+    )
 
     # 네트워크 및 GPU 모니터링 시작
     os.system('sh /workspace/network.sh &')  # network profile
@@ -1461,15 +1498,48 @@ if __name__ == "__main__":
     CACHE_DIR = '/workspace/model_cache'  # 컨테이너 내 사전 준비된 모델 캐시 경로
     DATASET_DIR = '/workspace/datasets'  # 컨테이너 내 사전 준비된 데이터셋 경로
 
+    # !!!! 메모리 설정을 가장 먼저 수행 !!!!
+    gpus = tf.config.experimental.list_physical_devices('GPU')
+    if gpus:
+        try:
+            for gpu in gpus:
+                tf.config.experimental.set_memory_growth(gpu, True)
+            print("GPU 메모리 증가 옵션 설정 완료")
+        except RuntimeError as e:
+            # 이미 초기화된 경우 무시
+            print(f"GPU 메모리 설정 중 오류 (무시 가능): {e}")
+
     # 분산 학습 전략 설정 - 안정성 개선
     os.environ['GRPC_VERBOSITY'] = 'ERROR'
     os.environ['TF_GRPC_DEFAULT_OPTIONS'] = 'grpc.keepalive_time_ms=30000,grpc.keepalive_timeout_ms=5000,grpc.keepalive_permit_without_calls=1,grpc.http2.max_pings_without_data=0,grpc.http2.min_time_between_pings_ms=10000,grpc.http2.min_ping_interval_without_data_ms=300000'
-    os.environ['TF_COLLECTIVE_OP_TIMEOUT'] = '120'
+    os.environ['TF_COLLECTIVE_OP_TIMEOUT'] = '1200'  # 600 -> 1200초 (20분)
+    
+    # 추가 안정성 설정
+    os.environ['TF_GRPC_WORKER_CACHE_ENABLED'] = '0'  # Worker 캐시 비활성화
+    os.environ['TF_COORDINATOR_TIMEOUT_SECONDS'] = '1200'  # 600 -> 1200초
+    os.environ['TF_ENABLE_EAGER_CLIENT_STREAMING_ENQUEUE'] = '0'  # 스트리밍 최적화 비활성화
+    os.environ['GRPC_MAX_CONNECTION_IDLE_MS'] = '60000'  # 30초 -> 60초
+    os.environ['GRPC_MAX_CONNECTION_AGE_MS'] = '600000'  # 5분 -> 10분
+    
+    # CoreDNS 관련 안정성 설정
+    os.environ['GRPC_DNS_RESOLVER'] = 'native'  # DNS 해석기 설정
+    os.environ['GRPC_POLL_STRATEGY'] = 'poll'  # 폴링 전략 설정
+    
+    # 2-노드 환경 특정 안정성 설정  
+    os.environ['NCCL_DEBUG'] = 'WARN'  # NCCL 디버그 정보
+    os.environ['NCCL_ALGO'] = 'Ring'  # NCCL 알고리즘을 Ring으로 강제
+    os.environ['NCCL_TREE_THRESHOLD'] = '0'  # Tree 알고리즘 비활성화
+    os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'  # GPU 메모리 점진적 증가 강제
+    os.environ['TF_GPU_THREAD_MODE'] = 'gpu_private'  # GPU 스레드 모드
+    
+    # 동기화 강화 설정
+    os.environ['TF_ENABLE_AUTO_MIXED_PRECISION'] = '0'  # 혼합 정밀도 비활성화
+    os.environ['TF_SYNC_ON_FINISH'] = '1'  # 작업 완료 시 동기화 강제
     
     # 통신 옵션으로 안정성 향상
     communication_options = tf.distribute.experimental.CommunicationOptions(
-        implementation=tf.distribute.experimental.CommunicationImplementation.NCCL,
-        timeout_seconds=120.0
+        implementation=tf.distribute.experimental.CommunicationImplementation.RING,  # NCCL -> RING으로 변경
+        timeout_seconds=1200.0  # 600초 -> 1200초 (20분)
     )
     
     strategy = tf.distribute.MultiWorkerMirroredStrategy(
