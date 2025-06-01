@@ -19,67 +19,113 @@ import os
 import sys
 import time
 import argparse
-import psutil # psutil 추가
 
 
 class Wav2Vec2Config:
     def __init__(self, model_size="small"):
-        # 기본 설정
-        self.hidden_size = 768
-        self.num_hidden_layers = 12
-        self.num_attention_heads = 12
-        self.intermediate_size = 3072
-        self.hidden_act = "gelu"
-        self.hidden_dropout = 0.1
-        self.activation_dropout = 0.1
-        self.attention_dropout = 0.1
-        self.feat_proj_dropout = 0.0  # 특징 프로젝션 드롭아웃
-        self.final_dropout = 0.1
-        self.layerdrop = 0.1
-        self.layer_norm_eps = 1e-5
-        self.initializer_range = 0.02
-        self.vocab_size = 32
-        
-        # 특징 추출기 설정
-        self.conv_dim = [512, 512, 512, 512, 512, 512, 512]
-        self.conv_stride = [5, 2, 2, 2, 2, 2, 2]
-        self.conv_kernel = [10, 3, 3, 3, 3, 2, 2]
-        self.conv_bias = False
-        
-        # 양자화 설정
-        self.num_codevectors_per_group = 320
-        self.num_codevector_groups = 2
-        self.codevector_dim = 256
-        
-        # 프로젝션 설정
-        self.proj_codevector_dim = 256
-        self.diversity_loss_weight = 0.1
-        
-        # 위치 임베딩 설정
-        self.num_conv_pos_embeddings = 128
-        self.num_conv_pos_embedding_groups = 16
-        self.do_stable_layer_norm = True
-        self.apply_spec_augment = True
-        self.mask_time_prob = 0.05
-        self.mask_time_length = 10
-        self.mask_time_min_masks = 2
-        self.mask_feature_prob = 0.0
-        self.mask_feature_length = 10
-        self.mask_feature_min_masks = 0
-        
-        # 모델 크기별 설정
-        if model_size == "tiny":
-            self.hidden_size = 384
+        # 모델 크기에 따른 설정
+        if model_size == "small":
+            # Small 모델 설정 (약 30-40M 파라미터)
+            self.hidden_size = 512
             self.num_hidden_layers = 6
-            self.num_attention_heads = 6
-            self.intermediate_size = 1536
-            self.conv_dim = [256, 256, 256, 256, 256, 256, 256]
-        elif model_size == "base":
+            self.num_attention_heads = 8
+            self.intermediate_size = 2048
+            self.conv_dim = [256, 256, 256, 256, 256]  # 5 layers, 채널 수 줄임
+            self.conv_stride = [5, 2, 2, 2, 2]
+            self.conv_kernel = [10, 3, 3, 3, 2]
+            self.num_conv_pos_embeddings = 64  # 128 → 64
+            self.num_conv_pos_embedding_groups = 8  # 16 → 8
+            
+        elif model_size == "tiny":
+            # Tiny 모델 설정 (약 15-20M 파라미터)
+            self.hidden_size = 256
+            self.num_hidden_layers = 4
+            self.num_attention_heads = 4
+            self.intermediate_size = 1024
+            self.conv_dim = [128, 128, 128, 128]  # 4 layers
+            self.conv_stride = [5, 2, 2, 2]
+            self.conv_kernel = [10, 3, 3, 2]
+            self.num_conv_pos_embeddings = 32
+            self.num_conv_pos_embedding_groups = 4
+            
+        else:  # base 모델 (기존 설정)
             self.hidden_size = 768
             self.num_hidden_layers = 12
             self.num_attention_heads = 12
             self.intermediate_size = 3072
-        # small은 기본값 사용
+            self.conv_dim = [512, 512, 512, 512, 512, 512, 512]
+            self.conv_stride = [5, 2, 2, 2, 2, 2, 2]
+            self.conv_kernel = [10, 3, 3, 3, 3, 2, 2]
+            self.num_conv_pos_embeddings = 128
+            self.num_conv_pos_embedding_groups = 16
+
+        # 특징 추출기 설정
+        self.feat_extract_norm = "group"
+        self.feat_extract_activation = "gelu"
+        self.conv_bias = False
+        
+        # 공통 설정들
+        self.hidden_act = "gelu"
+        self.hidden_dropout = 0.1
+        self.activation_dropout = 0.1
+        self.attention_dropout = 0.1
+        self.layer_norm_eps = 1e-5
+        
+        # 양자화 및 마스킹 설정 (small 모델에 맞게 조정)
+        if model_size == "small":
+            self.num_codevectors_per_group = 160  # 320 → 160
+            self.num_codevector_groups = 2
+            self.codevector_dim = 128  # 256 → 128
+            self.proj_codevector_dim = 128  # 256 → 128
+        elif model_size == "tiny":
+            self.num_codevectors_per_group = 80
+            self.num_codevector_groups = 2
+            self.codevector_dim = 64
+            self.proj_codevector_dim = 64
+        else:  # base
+            self.num_codevectors_per_group = 320
+            self.num_codevector_groups = 2
+            self.codevector_dim = 256
+            self.proj_codevector_dim = 256
+            
+        self.contrastive_logits_temperature = 0.1
+        self.num_negatives = 100
+        self.diversity_loss_weight = 0.1
+        self.ctc_loss_reduction = "sum"
+        self.ctc_zero_infinity = False
+        
+        # 미세 조정 설정
+        self.mask_time_prob = 0.05
+        self.mask_time_length = 10
+        self.mask_feature_prob = 0.0
+        self.mask_feature_length = 10
+        
+        # 추가 설정
+        self.vocab_size = 32
+        self.do_stable_layer_norm = True
+        self.use_weighted_layer_sum = False
+        
+        # 분류 관련 설정 (small 모델에 맞게 조정)
+        if model_size == "small":
+            self.classifier_proj_size = 128  # 256 → 128
+        elif model_size == "tiny":
+            self.classifier_proj_size = 64
+        else:
+            self.classifier_proj_size = 256
+            
+        # TDNN 설정도 작게 조정
+        if model_size == "small":
+            self.tdnn_dim = [256, 256, 256, 256, 768]
+            self.xvector_output_dim = 256
+        elif model_size == "tiny":
+            self.tdnn_dim = [128, 128, 128, 128, 384]
+            self.xvector_output_dim = 128
+        else:
+            self.tdnn_dim = [512, 512, 512, 512, 1500]
+            self.xvector_output_dim = 512
+            
+        self.tdnn_kernel = [5, 3, 3, 1, 1]
+        self.tdnn_dilation = [1, 2, 3, 1, 1]
 
 
 # Gelu 활성화 함수 정의
@@ -502,26 +548,16 @@ class Wav2Vec2Encoder(tf.keras.layers.Layer):
 
 # 프로젝션 헤드 구현
 class Wav2Vec2ProjectionHead(tf.keras.layers.Layer):
-    """Wav2Vec2 프로젝션 헤드 레이어"""
     def __init__(self, config):
-        super().__init__(name="projection_head")
-        self.dense = tf.keras.layers.Dense(config.proj_codevector_dim)
-        self.layer_norm = tf.keras.layers.LayerNormalization()
-        self.dropout = tf.keras.layers.Dropout(config.feat_proj_dropout)
-
+        super(Wav2Vec2ProjectionHead, self).__init__()
+        self.dense = tf.keras.layers.Dense(config.proj_codevector_dim, name="projection_head")
+        self.layer_norm = tf.keras.layers.LayerNormalization(epsilon=config.layer_norm_eps)
+        self.dropout = tf.keras.layers.Dropout(config.hidden_dropout)
+    
     def call(self, hidden_states, training=False):
-        """프로젝션 헤드 순전파"""
-        # 입력이 튜플이나 리스트인 경우 첫 번째 요소만 사용
-        if isinstance(hidden_states, (tuple, list)):
-            hidden_states = hidden_states[0]
-        
-        # 차원 확인 및 재구성
-        if len(tf.shape(hidden_states)) != 3:
-            hidden_states = tf.reshape(hidden_states, [-1, tf.shape(hidden_states)[1], tf.shape(hidden_states)[-1]])
-        
-        hidden_states = self.dropout(hidden_states, training=training)
         hidden_states = self.dense(hidden_states)
         hidden_states = self.layer_norm(hidden_states)
+        hidden_states = self.dropout(hidden_states, training=training)
         return hidden_states
 
 # Wav2Vec2Quantizer 클래스 구현 (수정됨)
@@ -718,15 +754,6 @@ class Wav2Vec2Model(tf.keras.Model):
         self.feature_projection_layer_norm = tf.keras.layers.LayerNormalization(epsilon=config.layer_norm_eps)
         self.feature_projection_dropout = tf.keras.layers.Dropout(config.hidden_dropout)
         
-        # 위치 인코딩을 위한 컨볼루션 레이어 추가
-        self.pos_conv_embed = tf.keras.layers.Conv1D(
-            filters=config.hidden_size,
-            kernel_size=config.num_conv_pos_embeddings,
-            padding="same",
-            groups=config.num_conv_pos_embedding_groups,
-            name="pos_conv_embed"
-        )
-        
         # 인코더
         self.encoder = Wav2Vec2Encoder(config)
         
@@ -735,110 +762,67 @@ class Wav2Vec2Model(tf.keras.Model):
         self.quantizer = Wav2Vec2Quantizer(config)
 
         # 투영 헤드
-        self.projection_head = Wav2Vec2ProjectionHead(config)
+        self.project_hid = Wav2Vec2ProjectionHead(config)
+        self.project_q = Wav2Vec2ProjectionHead(config)
     
     def call(self, inputs, attention_mask=None, 
              output_attentions=False, output_hidden_states=False,
              return_dict=True, training=False):
         
         # 1. 특징 추출
-        try:
-            extract_features = self.feature_extractor(inputs, training=training)
-        except Exception:
-            # 특징 추출 실패 시 기본 특징 생성
-            batch_size = tf.shape(inputs)[0]
-            seq_length = tf.shape(inputs)[1] // 320  # stride 고려한 대략적 길이
-            extract_features = tf.random.normal([batch_size, seq_length, self.config.conv_dim[-1]], dtype=tf.float32)
+        extract_features = self.feature_extractor(inputs, training=training)
         
-        # 1.5. 특징 투영 (hidden_size로 변환)
-        try:
-            extract_features = self.feature_projection(extract_features)
-            extract_features = self.feature_projection_layer_norm(extract_features)
-            extract_features = self.feature_projection_dropout(extract_features, training=training)
-        except Exception:
-            # 투영 실패 시 크기 조정
-            batch_size = tf.shape(inputs)[0]
-            seq_length = tf.shape(inputs)[1] // 320
-            extract_features = tf.random.normal([batch_size, seq_length, self.config.hidden_size], dtype=tf.float32)
+        # 2. 특징 투영 - hidden_size 차원으로 투영
+        # 특징 추출기의 출력 차원(conv_dim[-1])과 인코더의 입력 차원(hidden_size)을 맞추기 위한 투영
+        hidden_states = self.feature_projection(extract_features)
+        hidden_states = self.feature_projection_layer_norm(hidden_states)
+        hidden_states = self.feature_projection_dropout(hidden_states, training=training)
         
-        # 2. 양자화 (pretraining 중일 때만)
-        quantized_features = None
-        codevector_perplexity = tf.constant(1.0, dtype=tf.float32)
-        
+        # 3. 타겟 양자화를 위한 특징 제공
         if training:
-            try:
-                quantizer_output = self.quantizer(extract_features, training=training)
-                if isinstance(quantizer_output, dict):
-                    quantized_features = quantizer_output.get("quantized_features", extract_features)
-                    codevector_perplexity = quantizer_output.get("codevector_perplexity", tf.constant(1.0, dtype=tf.float32))
-                elif isinstance(quantizer_output, tuple) and len(quantizer_output) >= 2:
-                    quantized_features, codevector_perplexity = quantizer_output
-                else:
-                    quantized_features = quantizer_output
-            except Exception:
-                # 양자화 실패 시 원본 특징 사용
-                quantized_features = extract_features
-        
-        # 3. 특징 마스킹 (training 시에만)
-        if training:
-            try:
-                extract_features = apply_time_mask(extract_features, mask_prob=self.config.mask_time_prob, 
-                                                   mask_length=self.config.mask_time_length)
-                extract_features = apply_feature_mask(extract_features, mask_prob=0.05, mask_length=10)
-            except Exception:
-                # 마스킹 실패 시 원본 특징 사용
-                pass
-        
-        # 4. 위치 인코딩 추가
-        try:
-            pos_conv_output = self.pos_conv_embed(extract_features)
-            hidden_states = extract_features + pos_conv_output
-        except Exception:
-            # 위치 인코딩 실패 시 원본 특징 사용
-            hidden_states = extract_features
-        
-        # 5. Transformer 인코더
-        encoder_outputs = None  # 변수 미리 초기화
-        try:
-            encoder_outputs = self.encoder(
-                hidden_states,
-                attention_mask=attention_mask,
-                output_hidden_states=output_hidden_states,
-                output_attentions=output_attentions,
-                return_dict=return_dict,
-                training=training
-            )
+            # 양자화 대상 특징 - 투영된 특징을 사용
+            quantize_targets = hidden_states
             
-            if return_dict and isinstance(encoder_outputs, dict):
-                last_hidden_state = encoder_outputs.get("last_hidden_state", hidden_states)
-            else:
-                last_hidden_state = encoder_outputs if not isinstance(encoder_outputs, dict) else hidden_states
-                
-        except Exception:
-            # 인코더 실패 시 이전 hidden_states 사용
-            last_hidden_state = hidden_states
-            encoder_outputs = None  # 명시적으로 None 설정
-        
-        # 6. 프로젝션 헤드 적용 (선택적)
-        try:
-            projected_states = self.projection_head(last_hidden_state, training=training)
-        except Exception:
-            # 프로젝션 실패 시 마지막 hidden state 사용
-            projected_states = last_hidden_state
-        
-        # 7. 반환값 구성
-        if return_dict:
-            return {
-                "last_hidden_state": last_hidden_state,
-                "extract_features": extract_features,
-                "projected_states": projected_states,
-                "quantized_features": quantized_features,
-                "codevector_perplexity": codevector_perplexity,
-                "hidden_states": encoder_outputs.get("hidden_states") if (encoder_outputs is not None and isinstance(encoder_outputs, dict)) else None,
-                "attentions": encoder_outputs.get("attentions") if (encoder_outputs is not None and isinstance(encoder_outputs, dict)) else None,
-            }
+            # 양자화
+            quantized_result = self.quantizer(quantize_targets, training=True)
+            quantized_features = quantized_result["quantized_features"]
+            codevector_perplexity = quantized_result["codevector_perplexity"]
         else:
-            return last_hidden_state
+            quantized_features = None
+            codevector_perplexity = None
+        
+        # 4. 인코더에 전달
+        encoder_outputs = self.encoder(
+            hidden_states,
+            attention_mask=attention_mask,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            training=training
+        )
+        
+        if not return_dict:
+            return encoder_outputs
+        
+        # 반환값 준비
+        result = {
+            "last_hidden_state": encoder_outputs["last_hidden_state"],
+            "extract_features": extract_features
+        }
+        
+        if quantized_features is not None:
+            result["quantized_features"] = quantized_features
+        
+        if codevector_perplexity is not None:
+            result["codevector_perplexity"] = codevector_perplexity
+        
+        if output_hidden_states:
+            result["hidden_states"] = encoder_outputs["hidden_states"]
+        
+        if output_attentions:
+            result["attentions"] = encoder_outputs["attentions"]
+        
+        return result
 
 # 사전학습 wav2vec2 모델 구현 (수정됨)
 class Wav2Vec2ForPreTraining(tf.keras.Model):
@@ -849,21 +833,6 @@ class Wav2Vec2ForPreTraining(tf.keras.Model):
         # 기본 wav2vec2 모델
         self.wav2vec2 = Wav2Vec2Model(config)
         
-        # 컨트라스트 학습을 위한 프로젝션 레이어들 추가
-        self.project_hid = tf.keras.layers.Dense(
-            config.proj_codevector_dim, 
-            use_bias=False, 
-            name="project_hid"
-        )
-        self.project_q = tf.keras.layers.Dense(
-            config.proj_codevector_dim, 
-            use_bias=False, 
-            name="project_q"
-        )
-        
-        # Quantizer 추가
-        self.quantizer = Wav2Vec2Quantizer(config)
-        
         # 손실 계산 및 학습에 필요한 매개변수
         self.num_negatives = config.num_negatives
         self.contrastive_logits_temperature = config.contrastive_logits_temperature
@@ -871,79 +840,27 @@ class Wav2Vec2ForPreTraining(tf.keras.Model):
     
     def call(self, inputs, attention_mask=None, output_attentions=False, output_hidden_states=False, training=False):
         # wav2vec2 모델 호출
-        try:
-            wav2vec2_outputs = self.wav2vec2(
-                inputs, 
-                attention_mask=attention_mask,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                return_dict=True,
-                training=training
-            )
-        except Exception:
-            # wav2vec2 모델 호출 실패 시 기본값 생성
-            batch_size = tf.shape(inputs)[0]
-            seq_length = tf.shape(inputs)[1] // 320  # stride 고려
-            hidden_size = self.config.hidden_size
-            
-            wav2vec2_outputs = {
-                "last_hidden_state": tf.zeros([batch_size, seq_length, hidden_size], dtype=tf.float32),
-                "extract_features": tf.zeros([batch_size, seq_length, hidden_size], dtype=tf.float32),
-            }
+        outputs = self.wav2vec2(
+            inputs,
+            attention_mask=attention_mask,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            training=training
+        )
         
-        # 안전한 출력 추출
-        try:
-            hidden_states = wav2vec2_outputs.get("last_hidden_state")
-            quantized_features = wav2vec2_outputs.get("extract_features")
+        # 컨트라스트 학습을 위한 변환
+        if training and "quantized_features" in outputs:
+            # 인코더 출력 프로젝션
+            transformer_features = self.wav2vec2.project_hid(outputs["last_hidden_state"])
             
-            if hidden_states is None or quantized_features is None:
-                # 기본값 생성
-                batch_size = tf.shape(inputs)[0]
-                seq_length = tf.shape(inputs)[1] // 320  # stride 고려
-                hidden_size = self.config.hidden_size
-                
-                hidden_states = tf.zeros([batch_size, seq_length, hidden_size], dtype=tf.float32)
-                quantized_features = tf.zeros([batch_size, seq_length, hidden_size], dtype=tf.float32)
+            # 양자화된 특징 프로젝션
+            quantized_features = self.wav2vec2.project_q(outputs["quantized_features"])
             
-            # 프로젝션 적용
-            projected_states = self.project_hid(hidden_states)
-            projected_quantized_features = self.project_q(quantized_features)
-            
-            # Quantizer 호출 (안전하게) - wav2vec2 출력에서 가져오기 시도
-            codevector_perplexity = wav2vec2_outputs.get("codevector_perplexity")
-            if codevector_perplexity is None:
-                try:
-                    quantizer_output = self.quantizer(hidden_states, training=training)
-                    if isinstance(quantizer_output, tuple) and len(quantizer_output) >= 2:
-                        _, codevector_perplexity = quantizer_output
-                    else:
-                        codevector_perplexity = tf.constant(1.0, dtype=tf.float32)
-                except Exception:
-                    codevector_perplexity = tf.constant(1.0, dtype=tf.float32)
-            
-            return {
-                "projected_states": projected_states,
-                "projected_quantized_features": projected_quantized_features,
-                "codevector_perplexity": codevector_perplexity,
-                "last_hidden_state": hidden_states,
-                "extract_features": quantized_features
-            }
-            
-        except Exception:
-            # 완전한 오류 상황에서 기본 출력 반환
-            batch_size = tf.shape(inputs)[0]
-            seq_length = 100  # 기본 시퀀스 길이
-            hidden_size = self.config.hidden_size
-            
-            default_tensor = tf.zeros([batch_size, seq_length, hidden_size], dtype=tf.float32)
-            
-            return {
-                "projected_states": default_tensor,
-                "projected_quantized_features": default_tensor,
-                "codevector_perplexity": tf.constant(1.0, dtype=tf.float32),
-                "last_hidden_state": default_tensor,
-                "extract_features": default_tensor
-            }
+            # 손실 계산을 위한 정보 추가
+            outputs["projected_quantized_features"] = quantized_features
+            outputs["projected_states"] = transformer_features
+        
+        return outputs
     
     @tf.function
     def _compute_contrastive_loss(self, hidden_states, quantized_states):
@@ -1202,82 +1119,38 @@ def apply_feature_mask(hidden_states, mask_prob=0.05, mask_length=10):
     return masked_hidden_states, expanded_mask
 
 
-# 더미 오디오 데이터셋 생성 (수정됨 - from_generator 대신 range().map() 사용)
+# 더미 오디오 데이터셋 생성 (수정됨)
 def create_dummy_dataset(batch_size):
-    """더미 데이터셋 생성 (스레드 누수 방지를 위한 엄격한 설정)"""
-    
-    def generate_dummy_sample(_):
-        # 16kHz 오디오, 1초 길이
-        audio_length = 16000
-        dummy_audio = tf.random.normal([audio_length], dtype=tf.float32)
+    """
+    형태가 일관된 더미 오디오 데이터셋 생성 - 메모리 절약을 위해 길이 단축
+    """
+    def generate_consistent_data():
+        # 메모리 절약을 위해 더 짧은 오디오 데이터 생성 (2초)
+        audio_length = 32000  # 2초 * 16kHz (기존 5초에서 단축)
         
-        # 더미 레이블 (10개 클래스 중 하나)
-        dummy_label = tf.random.uniform([], minval=0, maxval=10, dtype=tf.int32)
+        # 더미 오디오 특징 생성
+        audio_features = tf.random.normal([audio_length], dtype=tf.float32)
         
-        return dummy_audio, dummy_label
+        # 더미 레이블
+        label = tf.constant(0.0, dtype=tf.float32)
+        
+        return audio_features, label
     
     # 데이터셋 생성
-    dataset = tf.data.Dataset.range(1000)  # 1000개 샘플
-    
-    # 스레드 누수 방지를 위한 엄격한 설정
-    options = tf.data.Options()
-    options.threading.private_threadpool_size = 1  # 스레드 풀 크기 제한
-    options.threading.max_intra_op_parallelism = 1  # 연산 내 병렬성 제한
-    options.experimental_optimization.parallel_batch = False  # 병렬 배치 비활성화
-    options.experimental_optimization.map_parallelization = False  # 맵 병렬화 비활성화
-    options.experimental_deterministic = True  # 결정적 실행
-    
-    dataset = dataset.with_options(options)
-    
-    # 맵 함수에서도 num_parallel_calls=1로 설정
-    dataset = dataset.map(
-        generate_dummy_sample,
-        num_parallel_calls=1
+    dataset = tf.data.Dataset.from_generator(
+        lambda: [generate_consistent_data() for _ in range(50)],
+        output_signature=(
+            tf.TensorSpec(shape=[32000], dtype=tf.float32),  # 길이 변경
+            tf.TensorSpec(shape=[], dtype=tf.float32)
+        )
     )
     
-    # 배치 설정에서도 drop_remainder=True로 설정하여 부분 배치 방지
+    # 배치 처리 - drop_remainder=True로 일관된 배치 크기 보장
     dataset = dataset.batch(batch_size, drop_remainder=True)
-    
-    # 프리페치도 1로 제한
-    dataset = dataset.prefetch(1)
+    dataset = dataset.repeat()
+    dataset = dataset.prefetch(tf.data.AUTOTUNE)
     
     return dataset
-
-
-# 시스템 리소스 로깅 함수 (psutil 사용)
-def log_system_resources():
-    p = psutil.Process(os.getpid())
-    print(f"---- System Resource Log (PID: {p.pid}) ----")
-    try:
-        # 파일 디스크립터
-        # psutil로는 시스템 전체 파일 디스크립터 정보를 직접 가져오기 어려움. /proc/sys/fs/file-nr 유지.
-        # 단, /proc 접근 권한이 없을 수 있으므로 try-except로 감쌈.
-        try:
-            with open('/proc/sys/fs/file-nr', 'r') as f:
-                fd_info = f.read().strip()
-                print(f"  [FD] System-wide: {fd_info}")
-        except Exception as e:
-            print(f"  [FD] System-wide: Error reading /proc/sys/fs/file-nr - {e}")
-        print(f"  [FD] Process ({p.pid}) num_fds: {p.num_fds()}")
-    except psutil.Error as e:
-        print(f"  [FD] Error getting FD info: {e}")
-
-    try:
-        # 스레드 수
-        print(f"  [Threads] Process ({p.pid}) num_threads: {p.num_threads()}")
-    except psutil.Error as e:
-        print(f"  [Threads] Error getting thread info: {e}")
-
-    try:
-        # 메모리 (RAM)
-        vm = psutil.virtual_memory()
-        print(f"  [Memory] System RAM: Total: {vm.total / (1024**2):.2f}MB, Available: {vm.available / (1024**2):.2f}MB, Used: {vm.used / (1024**2):.2f}MB, Percent: {vm.percent}%")
-        # 프로세스 메모리 (RSS, VSZ)
-        proc_mem = p.memory_info()
-        print(f"  [Memory] Process ({p.pid}) RSS: {proc_mem.rss / (1024**2):.2f}MB, VSZ: {proc_mem.vms / (1024**2):.2f}MB")
-    except psutil.Error as e:
-        print(f"  [Memory] Error getting memory info: {e}")
-    print("----------------------------------------")
 
 
 # 전체 모델과 데이터셋을 연결하여 분산 학습 실행
@@ -1309,102 +1182,99 @@ def create_full_model(model_type="pretraining",
         return Wav2Vec2Model(config)
 
 
-# 분산 학습 스텝 정의 (대폭 단순화하여 확실한 작동 보장)
-@tf.function 
-def distributed_train_step_tf_func(strategy, model, dist_inputs, optimizer):
-    """분산 학습을 위한 스텝 함수"""
+# 분산 학습 스텝 정의 (수정됨)
+def distributed_train_step(strategy, model, dist_inputs, optimizer):
+    """개선된 분산 학습 스텝"""
     
     def train_step(inputs):
         features, labels = inputs
         
-        with tf.GradientTape() as tape:
-            # 모델 호출
-            outputs = model(features, training=True)
-            
-            # Wav2Vec2ForPreTraining 모델의 경우
-            if isinstance(model, Wav2Vec2ForPreTraining):
-                if ("projected_states" in outputs and 
-                    "projected_quantized_states" in outputs and 
-                    outputs["projected_states"] is not None and 
-                    outputs["projected_quantized_states"] is not None):
-                    
-                    # 컨트라스트 손실 계산
-                    projected_states = outputs["projected_states"]
-                    projected_quantized = outputs["projected_quantized_states"]
-                    
-                    # L2 정규화
-                    projected_states = tf.math.l2_normalize(projected_states, axis=-1)
-                    projected_quantized = tf.math.l2_normalize(projected_quantized, axis=-1)
-                    
-                    # 코사인 유사도 계산
-                    logits = tf.matmul(projected_states, projected_quantized, transpose_b=True)
-                    logits = logits / 0.1  # temperature scaling
-                    
-                    # 레이블은 대각선 요소가 1인 행렬 (자기 자신과의 매칭)
-                    labels = tf.eye(tf.shape(logits)[0], dtype=tf.float32)
-                    
-                    # 컨트라스트 손실 계산
-                    contrastive_loss = tf.reduce_mean(
-                        tf.nn.softmax_cross_entropy_with_logits(labels=labels, logits=logits)
-                    )
-                    
-                    # 다양성 손실 추가
-                    if "codevector_perplexity" in outputs:
-                        diversity_loss = -tf.math.log(outputs["codevector_perplexity"])
+        # 배치 크기 검증
+        batch_size = tf.shape(features)[0]
+        
+        # 빈 배치인 경우 0 손실 반환
+        def empty_batch_fn():
+            return tf.constant(0.0, dtype=tf.float32)
+        
+        def normal_batch_fn():
+            with tf.GradientTape() as tape:
+                # 모델 순전파
+                outputs = model(features, training=True)
+                
+                # 손실 계산
+                if isinstance(model, Wav2Vec2ForPreTraining):
+                    if "projected_states" in outputs and "projected_quantized_features" in outputs:
+                        # 컨트라스트 손실 계산
+                        logits, contrastive_loss = model._compute_contrastive_loss(
+                            outputs["projected_states"],
+                            outputs["projected_quantized_features"]
+                        )
+                        
+                        # 다양성 손실 추가
+                        if "codevector_perplexity" in outputs:
+                            diversity_loss = model._compute_diversity_loss(outputs["codevector_perplexity"])
+                        else:
+                            diversity_loss = tf.constant(0.0)
+                        
+                        # 최종 손실
+                        loss = contrastive_loss + model.diversity_loss_weight * diversity_loss
                     else:
-                        diversity_loss = tf.constant(0.0, dtype=tf.float32)
-                    
-                    # 최종 손실
-                    loss = contrastive_loss + 0.1 * diversity_loss  # diversity_loss의 가중치 조정
+                        loss = tf.constant(0.0)
                 else:
-                    print("Warning: Required outputs for loss calculation not found")
-                    loss = tf.constant(0.0, dtype=tf.float32)
-            else:
-                # 다른 모델 타입의 경우
-                outputs = model(features, labels=labels, training=True)
-                loss = outputs.get("loss", 0.0)
+                    outputs = model(features, labels=labels, training=True)
+                    loss = outputs.get("loss", 0.0)
+                
+                # NaN 체크
+                loss = tf.where(tf.math.is_nan(loss), tf.constant(0.0), loss)
+                
+                # 분산 환경에서 손실 정규화
+                scaled_loss = loss / tf.cast(strategy.num_replicas_in_sync, tf.float32)
             
-            # NaN/Inf 체크 및 처리
-            loss = tf.where(
-                tf.math.is_finite(loss),
-                loss,
-                tf.constant(0.0, dtype=tf.float32)
-            )
+            # 그래디언트 계산
+            gradients = tape.gradient(scaled_loss, model.trainable_variables)
             
-            # 스케일링
-            scaled_loss = loss / tf.cast(strategy.num_replicas_in_sync, tf.float32)
+            # None 그래디언트 필터링
+            gradients = [
+                tf.zeros_like(var) if grad is None else grad 
+                for grad, var in zip(gradients, model.trainable_variables)
+            ]
+            
+            # 그래디언트 클리핑
+            gradients, _ = tf.clip_by_global_norm(gradients, 1.0)
+            
+            # 옵티마이저 적용
+            optimizer.apply_gradients(zip(gradients, model.trainable_variables))
+            
+            return scaled_loss
         
-        # 그래디언트 계산
-        gradients = tape.gradient(scaled_loss, model.trainable_variables)
-        
-        # None 그래디언트 필터링 및 클리핑
-        gradients = [
-            tf.clip_by_norm(
-                tf.zeros_like(var) if grad is None else grad,
-                1.0
-            )
-            for grad, var in zip(gradients, model.trainable_variables)
-        ]
-        
-        # 옵티마이저 적용
-        optimizer.apply_gradients(zip(gradients, model.trainable_variables))
-        
-        return loss  # 원래 손실값 반환 (스케일링되지 않은)
+        return tf.cond(
+            tf.equal(batch_size, 0),
+            empty_batch_fn,
+            normal_batch_fn
+        )
     
+    # 분산 전략으로 실행
     per_replica_losses = strategy.run(train_step, args=(dist_inputs,))
-    return strategy.reduce(tf.distribute.ReduceOp.MEAN, per_replica_losses, axis=None)
+    
+    # 손실 집계
+    return strategy.reduce(tf.distribute.ReduceOp.SUM, per_replica_losses, axis=None)
 
 # wav2vec2 모델 메인 학습 함수 (수정됨)
-def train_wav2vec2(strategy, task_type, model_type="pretraining", model_size="small", num_epochs=1, learning_rate=3e-5):
-    """Wav2Vec2 모델 학습 함수 (스레드 누수 방지를 위한 엄격한 설정 추가)"""
-    if task_type == 'chief':
-        print("--- train_wav2vec2 시작 전 리소스 상태 ---")
-        log_system_resources()
-
+def train_wav2vec2(strategy, model_type="pretraining", model_size="small", num_epochs=1, learning_rate=3e-5):
+    """수정된 wav2vec2 모델 학습 함수"""
+    
     with strategy.scope():
+        # 모델 생성
         model = create_full_model(model_type=model_type, model_size=model_size)
+        
+        # 옵티마이저 설정
         optimizer = tf.keras.optimizers.Adam(
-            learning_rate=learning_rate, epsilon=1e-8, clipnorm=1.0)
+            learning_rate=learning_rate,
+            epsilon=1e-8,
+            clipnorm=1.0
+        )
+        
+        # 메트릭 설정
         metrics = []
         if model_type == "pretraining":
             metrics.extend([
@@ -1419,142 +1289,159 @@ def train_wav2vec2(strategy, task_type, model_type="pretraining", model_size="sm
                 tf.keras.metrics.SparseCategoricalAccuracy(name="accuracy"),
                 tf.keras.metrics.Mean(name="loss")
             ])
+        
+        # 모델 컴파일
         model.compile(optimizer=optimizer, metrics=metrics)
-
-    # 데이터셋 생성 및 엄격한 옵션 설정
+    
+    # 데이터셋 생성
     train_dataset = create_dummy_dataset(GLOBAL_BATCH_SIZE)
-    
-    # 분산 데이터셋 옵션 설정
-    options = tf.data.Options()
-    options.experimental_distribute.auto_shard_policy = tf.data.experimental.AutoShardPolicy.DATA
-    
-    # 스레드 누수 방지를 위한 엄격한 설정
-    options.threading.private_threadpool_size = 1
-    options.threading.max_intra_op_parallelism = 1
-    options.experimental_optimization.parallel_batch = False
-    options.experimental_optimization.map_parallelization = False
-    options.experimental_deterministic = True
-    
-    # 메모리 사용량 최적화
-    options.experimental_optimization.map_and_batch_fusion = False
-    
-    train_dataset = train_dataset.with_options(options)
     dist_dataset = strategy.experimental_distribute_dataset(train_dataset)
     
     # 체크포인트 설정
     checkpoint_dir = '/workspace/checkpoints'
     os.makedirs(checkpoint_dir, exist_ok=True)
     checkpoint = tf.train.Checkpoint(model=model, optimizer=optimizer)
-
+    
+    # 학습 루프
     step = 0
     iterator = iter(dist_dataset)
+    
+    # 시작 시간 기록
     start_time = time.time()
     
     for epoch in range(num_epochs):
-        if task_type == 'chief':
-            print(f"Epoch {epoch+1}/{num_epochs}")
+        print(f"Epoch {epoch+1}/{num_epochs}")
         
-        for i in range(MAX_ITERATIONS):
-            if task_type == 'chief' and i % 5 == 0: 
-                print(f"--- distributed_train_step_tf_func 호출 전 (Epoch: {epoch+1}, Iter: {i}, Global Step: {step}) --- ")
-                log_system_resources()
-
+        for _ in range(MAX_ITERATIONS):
             try:
+                # 분산 데이터셋에서 배치 가져오기
                 inputs = next(iterator)
+                
+                # 현재 시간 기록
                 step_start = time.time()
-                loss = distributed_train_step_tf_func(strategy, model, inputs, optimizer)
+                
+                # 분산 학습 스텝 실행 (strategy 명시적 전달)
+                loss = distributed_train_step(strategy, model, inputs, optimizer)
+                
+                # 스텝 완료 시간
                 step_end = time.time()
                 step_duration = step_end - step_start
                 elapsed = step_end - start_time
                 
-                if task_type == 'chief':
-                    print(f"✓ Step {step}, Loss: {loss:.4f}, Time: {time.strftime('%H:%M:%S')} (경과: {elapsed:.2f}초, 스텝 시간: {step_duration:.2f}초)")
-                    log_system_resources()
+                # 모든 스텝에 대해 타임스탬프와 함께 로깅
+                try:
+                    loss_value = float(loss)
+                except:
+                    loss_value = 0.0
+                print(f"Step {step}, Loss: {loss_value:.4f}, Time: {time.strftime('%H:%M:%S')} (경과: {elapsed:.2f}초, 스텝 시간: {step_duration:.2f}초)")
                 
                 step += 1
                 
+                # 주기적 체크포인트 저장
+                if step % 50 == 0:
+                    checkpoint.save(os.path.join(checkpoint_dir, f"model_step_{step}"))
+                
             except StopIteration:
+                iterator = iter(dist_dataset)
+                inputs = next(iterator)
+                
+                # 현재 시간 기록
+                step_start = time.time()
+                
+                # 분산 학습 스텝 실행
+                loss = distributed_train_step(strategy, model, inputs, optimizer)
+                
+                # 스텝 완료 시간
+                step_end = time.time()
+                step_duration = step_end - step_start
+                elapsed = step_end - start_time
+                
+                try:
+                    loss_value = float(loss)
+                except:
+                    loss_value = 0.0
+                print(f"Step {step}, Loss: {loss_value:.4f}, Time: {time.strftime('%H:%M:%S')} (경과: {elapsed:.2f}초, 스텝 시간: {step_duration:.2f}초)")
+                
+                step += 1
+                
+            except Exception as e:
+                print(f"Error at step {step}: {e}")
+                # 에러 발생 시 데이터셋 재시작
                 iterator = iter(dist_dataset)
                 continue
         
-        if task_type == 'chief':
-            print("--- train_wav2vec2 중간 리소스 상태 (에포크 종료) ---")
-            log_system_resources()
-            
-            # 에포크 종료 후 체크포인트 저장
-            checkpoint.save(os.path.join(checkpoint_dir, f"wav2vec2_{model_size}_epoch_{epoch+1}"))
-    
-    if task_type == 'chief':
-        print("--- train_wav2vec2 종료 직후 리소스 상태 ---")
-        log_system_resources()
-        print("Training completed.")
-        
-        # 모델 저장
-        model_save_path = f'/workspace/model_cache/wav2vec2_{model_size}_model'
-        model.save(model_save_path)
-        print(f"{model_size.capitalize()} 모델이 {model_save_path}에 저장되었습니다.")
+        # 에포크 종료 후 체크포인트 저장
+        checkpoint.save(os.path.join(checkpoint_dir, f"model_epoch_{epoch+1}"))
     
     return model
 
 
 # 메인 함수
 def main(strategy, model_size):
-    tf_config = json.loads(os.environ.get('TF_CONFIG') or '{}')
-    task_config = tf_config.get('task', {})
-    task_type = task_config.get('type', 'chief') 
-    task_index = task_config.get('index', 0)
-
-    if task_type == 'chief':
-        print("Wav2Vec2 분산 학습 시작...")
-        print(f"선택된 모델 크기: {model_size}")
-        if model_size == "tiny":
-            print("Tiny 모델: 약 15-20M 파라미터")
-        elif model_size == "small":
-            print("Small 모델: 약 30-40M 파라미터")
-        else:
-            print("Base 모델: 약 95M 파라미터")
-        print("16GB V100 GPU에 최적화된 설정")
+    print("Wav2Vec2 분산 학습 시작...")
+    print(f"선택된 모델 크기: {model_size}")
     
+    # 모델 크기별 파라미터 수 안내
+    if model_size == "tiny":
+        print("Tiny 모델: 약 15-20M 파라미터")
+    elif model_size == "small":
+        print("Small 모델: 약 30-40M 파라미터")
+    else:
+        print("Base 모델: 약 95M 파라미터")
+    
+    print("16GB V100 GPU에 최적화된 설정")
+    
+    # 메모리 최적화 설정
     gpus = tf.config.experimental.list_physical_devices('GPU')
     if gpus:
         try:
             for gpu in gpus:
                 tf.config.experimental.set_memory_growth(gpu, True)
         except RuntimeError as e:
-            if task_type == 'chief':
-                 print(f"GPU 메모리 설정 오류: {e}")
+            print(f"GPU 메모리 설정 오류: {e}")
     
-    start_time_jct = time.time()
-    model = train_wav2vec2(strategy, task_type, model_type="pretraining", model_size=model_size)
-    end_time_jct = time.time()
-    jct = end_time_jct - start_time_jct
+    # 네트워크 및 GPU 모니터링 시작
+    os.system('sh /workspace/network.sh &')  # network profile
+    os.system('sh /workspace/gpu.sh &')  # gpu profile
+    print('''
+========================
+network profile started!
+========================''')
     
-    if task_type == 'chief':
-        print("Training completed.")
-        print("jct:", jct)
-        try:
-            model_txt_path = '/workspace/model.txt'
-            save_dir_name = "default_save_dir" 
-            if os.path.exists(model_txt_path):
-                with open(model_txt_path, 'r') as f_model_txt:
-                    save_dir_name = f_model_txt.read().strip()
-            
-            result_dir = os.path.join('/result', save_dir_name)
-            os.makedirs(result_dir, exist_ok=True)
-            # JCT 파일명에 task_type과 task_index를 포함하도록 수정
-            jct_file_path = os.path.join(result_dir, f'{task_type}_{task_index}_jct.txt')
-            
-            with open(jct_file_path, 'w') as f_jct:
-                f_jct.write('%.2f' % (float(jct)))
-            print(f"JCT 파일 저장 완료: {jct_file_path}")
-        except Exception as e:
-            print(f"JCT 파일 저장 중 오류: {e}")
-        
-        model_path = os.path.join(CACHE_DIR, f"wav2vec2_{model_size}_model")
-        model.save_weights(model_path)
-        print(f"{model_size.capitalize()} 모델이 {model_path}에 저장되었습니다.")
+    # JCT 측정 시작
+    start_time = time.time()
+    start_time_tf = tf.timestamp()
+    
+    # 모델 학습 실행
+    model = train_wav2vec2(strategy, model_type="pretraining", model_size=model_size)
+    
+    # JCT 측정 종료
+    end_time = time.time()
+    jct = end_time - start_time
+    
+    # 결과 출력
+    print("Training completed.")
+    print("jct:", jct)
+    
+    # JCT 파일 저장
+    try:
+        model_txt = open('/workspace/model.txt', 'r')
+        save_dir_name = model_txt.read()
+        jct_file = open('/result/' + save_dir_name.strip() + '/' + task_type + '_' + str(task_index) + '_jct.txt', 'w')
+        jct_file.write('%.2f' % (float(jct)))
+        jct_file.close()
+        model_txt.close()
+    except Exception as e:
+        print(f"JCT 파일 저장 중 오류: {e}")
+    
+    # 모델 저장
+    model_path = os.path.join(CACHE_DIR, f"wav2vec2_{model_size}_model")
+    model.save_weights(model_path)
+    print(f"{model_size.capitalize()} 모델이 {model_path}에 저장되었습니다.")
+
 
 if __name__ == "__main__":
+    # 명령줄 인자 파싱
     parser = argparse.ArgumentParser(description='wav2vec2 Distributed Speech Recognition')
     parser.add_argument('--num_batches', type=int, default=5, help='num_batches per replica, default is set 5')
     parser.add_argument('--batch_size', type=int, default=1, help='batch size per replica, default is set 1')
@@ -1562,47 +1449,39 @@ if __name__ == "__main__":
                        help='Model size: tiny (~15-20M params), small (~30-40M params), base (~95M params)')
     args = parser.parse_args()
 
-    tf_config_env = os.environ.get('TF_CONFIG')
-    if not tf_config_env:
-        print("TF_CONFIG 환경 변수가 설정되지 않았습니다. 단일 워커 모드로 실행될 수 있습니다.")
-        default_tf_config = {
-            'cluster': {
-                'chief': ['localhost:2222']
-            },
-            'task': {'type': 'chief', 'index': 0}
-        }
-        os.environ['TF_CONFIG'] = json.dumps(default_tf_config)
-        print(f"기본 TF_CONFIG 사용: {os.environ['TF_CONFIG']}")
+    # 환경 설정
+    tf_config = json.loads(os.environ.get('TF_CONFIG') or '{}')
+    task_config = tf_config.get('task', {})
+    task_type = task_config.get('type')
+    task_index = task_config.get('index')
 
-    CACHE_DIR = '/workspace/model_cache'
-    DATASET_DIR = '/workspace/datasets'
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    os.makedirs(DATASET_DIR, exist_ok=True)
-    os.makedirs('/result', exist_ok=True)
+    # 모델과 프로세서를 저장할 로컬 디렉토리 설정
+    CACHE_DIR = '/workspace/model_cache'  # 컨테이너 내 사전 준비된 모델 캐시 경로
+    DATASET_DIR = '/workspace/datasets'  # 컨테이너 내 사전 준비된 데이터셋 경로
 
+    # 분산 학습 전략 설정 - 안정성 개선
     os.environ['GRPC_VERBOSITY'] = 'ERROR'
-    os.environ['TF_GRPC_DEFAULT_OPTIONS'] = 'grpc.keepalive_time_ms=30000,grpc.keepalive_timeout_ms=5000,grpc.keepalive_permit_without_calls=1,grpc.http2.max_pings_without_data=0,grpc.http2.min_time_between_pings_ms=10000,grpc.http2.min_ping_interval_without_data_ms=300000'
-    os.environ['TF_COLLECTIVE_OP_TIMEOUT'] = '300'
+    os.environ['TF_GRPC_DEFAULT_OPTIONS'] = 'grpc.keepalive_time_ms=30000,grpc.keepalive_timeout_ms=5000,grpc.keepalive_permit_without_calls=true,grpc.http2.max_pings_without_data=0,grpc.http2.min_time_between_pings_ms=10000,grpc.http2.min_ping_interval_without_data_ms=300000'
+    os.environ['TF_COLLECTIVE_OP_TIMEOUT'] = '120'
     
+    # 통신 옵션으로 안정성 향상
     communication_options = tf.distribute.experimental.CommunicationOptions(
         implementation=tf.distribute.experimental.CommunicationImplementation.NCCL,
-        timeout_seconds=300.0
+        timeout_seconds=120.0
     )
     
     strategy = tf.distribute.MultiWorkerMirroredStrategy(
         communication_options=communication_options
     )
 
+    # 하이퍼파라미터 설정
     BATCH_SIZE_PER_REPLICA = args.batch_size
     GLOBAL_BATCH_SIZE = BATCH_SIZE_PER_REPLICA * strategy.num_replicas_in_sync
     MAX_ITERATIONS = args.num_batches
     BUFFER_SIZE = 10000
 
-    tf_config_local = json.loads(os.environ.get('TF_CONFIG') or '{}')
-    task_type_local = tf_config_local.get('task', {}).get('type', 'chief')
-    if task_type_local == 'chief':
-        print(f'선택된 모델 크기: {args.model_size}')
-        print(f'batch size per replica: {BATCH_SIZE_PER_REPLICA}, global batch size: {GLOBAL_BATCH_SIZE}')
-        print(f'num_batches: {MAX_ITERATIONS}')
+    print(f'선택된 모델 크기: {args.model_size}')
+    print(f'batch size per replica: {BATCH_SIZE_PER_REPLICA}, global batch size: {GLOBAL_BATCH_SIZE}')
+    print(f'num_batches: {MAX_ITERATIONS}')
     
     main(strategy, args.model_size)
