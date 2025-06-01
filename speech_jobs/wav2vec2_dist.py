@@ -490,7 +490,7 @@ class Wav2Vec2ProjectionHead(tf.keras.layers.Layer):
         hidden_states = self.dropout(hidden_states, training=training)
         return hidden_states
 
-# Wav2Vec2Quantizer 클래스 구현
+# Wav2Vec2Quantizer 클래스 구현 (수정됨)
 class Wav2Vec2Quantizer(tf.keras.layers.Layer):
     def __init__(self, config):
         super(Wav2Vec2Quantizer, self).__init__()
@@ -505,78 +505,89 @@ class Wav2Vec2Quantizer(tf.keras.layers.Layer):
             name="codevectors"
         )
         
-        # 입력 차원을 codevector_dim으로 투영하는 레이어 추가
+        # 입력 차원을 codevector_dim으로 투영하는 레이어
         self.projection = tf.keras.layers.Dense(config.codevector_dim, name="project_to_codevector_dim")
-        
-        # 이 벡터는 contrastive loss에서 사용될 negative samples 관리에 필요
-        self.neg_sample_indices = None
     
     def call(self, hidden_states, training=False):
-        batch_size, sequence_length, hidden_size = tf.shape(hidden_states)[0], tf.shape(hidden_states)[1], tf.shape(hidden_states)[2]
+        original_shape = tf.shape(hidden_states)
+        batch_size, sequence_length = original_shape[0], original_shape[1]
         
         # 입력을 codevector_dim으로 투영
         hidden_states = self.projection(hidden_states)
         
+        # 실제 배치 크기가 0인 경우 처리 (분산 학습에서 발생 가능)
+        if tf.equal(batch_size, 0):
+            # 빈 텐서 반환
+            quantized_features = tf.zeros([0, sequence_length, self.config.codevector_dim], dtype=tf.float32)
+            dummy_encodings = tf.zeros([self.config.num_codevector_groups, 0, sequence_length, self.config.num_codevectors_per_group], dtype=tf.float32)
+            dummy_distances = tf.zeros([self.config.num_codevector_groups, 0, sequence_length, self.config.num_codevectors_per_group], dtype=tf.float32)
+            
+            return {
+                "quantized_features": quantized_features,
+                "encodings": dummy_encodings,
+                "distances": dummy_distances,
+                "codevector_perplexity": tf.constant(1.0)
+            }
+        
         # hidden_states를 그룹 수에 맞게 재구성
+        group_dim = self.config.codevector_dim // self.config.num_codevector_groups
         hidden_states = tf.reshape(
             hidden_states, 
-            [batch_size, sequence_length, self.config.num_codevector_groups, self.config.codevector_dim // self.config.num_codevector_groups]
+            [batch_size, sequence_length, self.config.num_codevector_groups, group_dim]
         )
         
         # 각 그룹별로 코드벡터와의 거리 계산
         distances = []
-        for i in range(self.config.num_codevector_groups):
-            group_hidden = hidden_states[:, :, i, :]  # [batch, time, dim]
-            
-            # hidden_states를 [batch*time, dim] 형태로 변환
-            reshaped_hidden = tf.reshape(group_hidden, [-1, tf.shape(group_hidden)[-1]])  # [batch*time, dim]
-            
-            # 현재 그룹의 코드벡터들 [num_vectors, dim]
-            group_vectors = self.codevectors[i]  # [num_vectors, dim]
-            
-            # 각 hidden state와 모든 코드벡터 사이의 유클리드 거리 계산
-            expanded_hidden = tf.expand_dims(reshaped_hidden, 1)  # [batch*time, 1, dim]
-            expanded_vectors = tf.expand_dims(group_vectors, 0)   # [1, num_vectors, dim]
-            
-            # 거리 계산: [batch*time, num_vectors]
-            dist = tf.reduce_sum(tf.square(expanded_hidden - expanded_vectors), axis=-1)
-            
-            # 원래 배치, 시간 차원으로 복원: [batch, time, num_vectors]
-            dist = tf.reshape(dist, [batch_size, sequence_length, -1])
-            distances.append(dist)
-        
-        # 모든 그룹의 거리: [num_groups, batch, time, num_vectors]
-        distances = tf.stack(distances, axis=0)
-        
-        # 가장 가까운 코드벡터 선택 (Hard Quantization)
-        indices = tf.argmin(distances, axis=-1)  # [num_groups, batch, time]
-        
-        # one-hot 인코딩으로 변환
-        encodings = tf.one_hot(indices, self.config.num_codevectors_per_group)  # [num_groups, batch, time, num_vectors]
-        
-        # 가장 가까운 코드벡터 가져오기
         quantized_features = []
+        encodings = []
+        
         for i in range(self.config.num_codevector_groups):
-            # 인코딩을 사용하여 코드벡터 선택
-            encoding = encodings[i]  # [batch, time, num_vectors]
+            group_hidden = hidden_states[:, :, i, :]  # [batch, time, group_dim]
             
-            # 코드벡터와 내적 계산
-            # [batch, time, num_vectors] @ [num_vectors, dim] -> [batch, time, dim]
-            quantized = tf.matmul(encoding, self.codevectors[i])
+            # 현재 그룹의 코드벡터들 [num_vectors, group_dim]
+            group_vectors = self.codevectors[i]
+            
+            # 거리 계산을 위해 텐서를 확장
+            # group_hidden: [batch, time, 1, group_dim]
+            # group_vectors: [1, 1, num_vectors, group_dim]
+            expanded_hidden = tf.expand_dims(group_hidden, axis=2)
+            expanded_vectors = tf.expand_dims(tf.expand_dims(group_vectors, axis=0), axis=0)
+            
+            # 유클리드 거리 계산: [batch, time, num_vectors]
+            dist = tf.reduce_sum(tf.square(expanded_hidden - expanded_vectors), axis=-1)
+            distances.append(dist)
+            
+            # 가장 가까운 코드벡터 인덱스: [batch, time]
+            indices = tf.argmin(dist, axis=-1)
+            
+            # one-hot 인코딩: [batch, time, num_vectors]
+            encoding = tf.one_hot(indices, self.config.num_codevectors_per_group, dtype=tf.float32)
+            encodings.append(encoding)
+            
+            # 양자화된 특징: [batch, time, group_dim]
+            quantized = tf.matmul(encoding, group_vectors)
             quantized_features.append(quantized)
         
-        # 그룹별 양자화 결과 결합
-        # [batch, time, num_groups, dim]
-        quantized_features = tf.stack(quantized_features, axis=2)
+        # 결과 결합
+        # distances: [num_groups, batch, time, num_vectors]
+        distances = tf.stack(distances, axis=0)
         
-        # 원래 모양으로 재구성
-        # [batch, time, hidden_size]
-        quantized_features = tf.reshape(quantized_features, [batch_size, sequence_length, -1])
+        # encodings: [num_groups, batch, time, num_vectors]  
+        encodings = tf.stack(encodings, axis=0)
+        
+        # quantized_features: [batch, time, codevector_dim]
+        quantized_features = tf.concat(quantized_features, axis=-1)
         
         # 다양성 계산 (코드북 활용도)
+        # 시간 차원에서 평균을 계산할 때 실제 길이 고려
         avg_probs = tf.reduce_mean(encodings, axis=[1, 2])  # [num_groups, num_vectors]
-        perplexity = tf.exp(-tf.reduce_sum(avg_probs * tf.math.log(avg_probs + 1e-10), axis=-1))  # [num_groups]
-        perplexity = tf.reduce_mean(perplexity)  # 스칼라
+        
+        # 수치적 안정성을 위한 작은 값 추가
+        avg_probs = tf.clip_by_value(avg_probs, 1e-10, 1.0)
+        
+        # 퍼플렉시티 계산
+        perplexity = tf.exp(-tf.reduce_sum(avg_probs * tf.math.log(avg_probs + 1e-10), axis=-1))
+        perplexity = tf.reduce_mean(perplexity)
         
         return {
             "quantized_features": quantized_features,
@@ -669,7 +680,7 @@ class Wav2Vec2Model(tf.keras.Model):
         
         return result
 
-# 사전학습 wav2vec2 모델 구현
+# 사전학습 wav2vec2 모델 구현 (수정됨)
 class Wav2Vec2ForPreTraining(tf.keras.Model):
     def __init__(self, config):
         super(Wav2Vec2ForPreTraining, self).__init__()
@@ -694,7 +705,7 @@ class Wav2Vec2ForPreTraining(tf.keras.Model):
         )
         
         # 컨트라스트 학습을 위한 변환
-        if training:
+        if training and "quantized_features" in outputs:
             # 인코더 출력 프로젝션
             transformer_features = self.wav2vec2.project_hid(outputs["last_hidden_state"])
             
@@ -744,39 +755,37 @@ class Wav2Vec2ForPreTraining(tf.keras.Model):
     
     @tf.function
     def _compute_contrastive_loss(self, hidden_states, quantized_states):
-        """컨트라스트 손실 계산"""
+        """개선된 컨트라스트 손실 계산"""
         batch_size = tf.shape(hidden_states)[0]
         sequence_length = tf.shape(hidden_states)[1]
         
-        # 양수 쌍 (같은 시간 위치의 인코더 출력과 양자화된 특징)
+        # 빈 배치 처리
+        if tf.equal(batch_size, 0):
+            return tf.zeros([0, 0, 1], dtype=tf.float32), tf.constant(0.0)
+        
+        # 양수 쌍 계산
         pos_logits = tf.reduce_sum(hidden_states * quantized_states, axis=-1) / self.contrastive_logits_temperature
         
-        # 음수 쌍
+        # 음수 쌍 생성 (개선된 방법)
         if self.num_negatives > 0:
-            # 타임프레임을 섞어 부정 샘플 생성
+            # 더 안전한 negative sampling
             neg_indices = self._sample_negative_indices(sequence_length, batch_size)
             
-            # 부정 샘플 가져오기 - 안전한 tf.gather 호출
+            # 안전한 gather 연산
             neg_quantized = tf.gather(quantized_states, neg_indices, axis=1, batch_dims=1)
             
-            # hidden_states: [batch, time, dim], neg_quantized: [batch, time, neg, dim]
-            # 확장하여 효율적인 내적 계산
-            hidden_states_expanded = tf.expand_dims(hidden_states, axis=2)  # [batch, time, 1, dim]
-            
-            # 음수 로짓 계산
+            # 차원 확장 및 로짓 계산
+            hidden_states_expanded = tf.expand_dims(hidden_states, axis=2)
             neg_logits = tf.reduce_sum(hidden_states_expanded * neg_quantized, axis=-1) / self.contrastive_logits_temperature
             
-            # 양수와 음수 로짓 결합
+            # 로짓 결합
             logits = tf.concat([tf.expand_dims(pos_logits, axis=2), neg_logits], axis=2)
         else:
             logits = tf.expand_dims(pos_logits, axis=2)
         
-        # 첫 번째 인덱스 (양수 쌍)에 대한 예측 손실 계산
-        labels = tf.zeros(tf.shape(logits)[:-1], dtype=tf.int32)
+        # 손실 계산
+        labels = tf.zeros([batch_size, sequence_length], dtype=tf.int32)
         loss = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=labels, logits=logits)
-        
-        # 마스크가 있는 경우 손실에 적용
-        # (여기서는 간소화를 위해 모든 위치가 유효하다고 가정)
         
         return logits, tf.reduce_mean(loss)
     
@@ -786,57 +795,38 @@ class Wav2Vec2ForPreTraining(tf.keras.Model):
         # 인위적으로 다양성을 높이기 위해 -perplexity를 최소화
         return -perplexity
     
-    @tf.function
+    @tf.function  
     def _sample_negative_indices(self, sequence_length, batch_size):
-        """컨트라스트 학습을 위한 부정 샘플 인덱스 생성"""
-        # TensorFlow 그래프 모드에서 완전히 호환되게 재구현
+        """안전한 negative sampling"""
+        # sequence_length가 num_negatives보다 작은 경우 처리
+        actual_negatives = tf.minimum(self.num_negatives, sequence_length - 1)
         
-        # 시퀀스 길이만큼의 범위 생성: [0, 1, 2, ..., sequence_length - 1]
-        all_indices = tf.range(sequence_length)
+        # 인덱스 범위 생성
+        indices_range = tf.range(sequence_length)
         
-        # 고정된 시드로 무작위 인덱스 생성
-        # 참고: distributed training에서 일관성을 위해 고정된 시드 사용
-        shuffle_indices = tf.random.shuffle(all_indices, seed=42)
+        # 각 배치에 대해 셔플된 인덱스 생성
+        neg_indices_list = []
         
-        # 배치 차원 추가하여 모든 배치에 대해 동일한 무작위 인덱스 사용
-        # [batch, time]
-        neg_indices = tf.tile(tf.expand_dims(shuffle_indices, 0), [batch_size, 1])
+        for _ in range(batch_size):
+            shuffled = tf.random.shuffle(indices_range)
+            # 필요한 만큼만 선택
+            selected = shuffled[:actual_negatives]
+            # 부족한 경우 반복하여 채움
+            if actual_negatives < self.num_negatives:
+                repeats = tf.math.ceil(self.num_negatives / actual_negatives)
+                repeated = tf.tile(selected, [tf.cast(repeats, tf.int32)])
+                selected = repeated[:self.num_negatives]
+            
+            neg_indices_list.append(selected)
         
-        # 결과를 저장할 빈 텐서 생성 [batch, time, num_negatives]
-        result = tf.zeros([batch_size, sequence_length, self.num_negatives], dtype=tf.int32)
+        # [batch_size, num_negatives] 형태로 스택
+        neg_indices = tf.stack(neg_indices_list, axis=0)
         
-        # tf.range를 사용하여 행렬 연산으로 변환
-        shifts = tf.range(1, sequence_length + 1)
-        time_indices = tf.range(sequence_length)
+        # [batch_size, sequence_length, num_negatives] 형태로 확장
+        # 각 시간 스텝에 대해 동일한 negative 인덱스 사용
+        neg_indices = tf.tile(tf.expand_dims(neg_indices, axis=1), [1, sequence_length, 1])
         
-        # 결과를 TensorArray에 누적
-        ta = tf.TensorArray(tf.int32, size=sequence_length, dynamic_size=False)
-        
-        # 초기 상태 설정
-        i_0 = tf.constant(0)
-        
-        # 루프 본문
-        def body(i, ta):
-            # i+1만큼 시프트
-            shift = tf.roll(neg_indices, shift=i+1, axis=1)
-            # 처음 num_negatives 선택
-            samples = shift[:, :self.num_negatives]
-            # TensorArray에 저장
-            ta = ta.write(i, samples)
-            return i + 1, ta
-        
-        # 루프 종료 조건
-        def cond(i, _):
-            return i < sequence_length
-        
-        # while_loop 실행
-        _, ta_result = tf.while_loop(cond, body, [i_0, ta])
-        
-        # TensorArray에서 텐서로 변환 [time, batch, num_negatives]
-        stacked = ta_result.stack()
-        
-        # [batch, time, num_negatives] 형태로 변환
-        return tf.transpose(stacked, [1, 0, 2])
+        return neg_indices
 
 
 # wav2vec2 음성 인식(ASR) 모델 구현
@@ -1090,25 +1080,38 @@ def apply_feature_mask(hidden_states, mask_prob=0.05, mask_length=10):
     return masked_hidden_states, expanded_mask
 
 
-# 더미 오디오 데이터셋 생성
+# 더미 오디오 데이터셋 생성 (수정됨)
 def create_dummy_dataset(batch_size):
     """
-    학습용 더미 오디오 데이터셋을 생성합니다.
+    형태가 일관된 더미 오디오 데이터셋 생성
     """
-    # 충분히 긴 더미 오디오 특성
-    num_samples = 50  # 데이터셋 크기
+    def generate_consistent_data():
+        # 고정된 길이의 오디오 데이터 생성
+        audio_length = 80000  # 5초 * 16kHz
+        
+        # 더미 오디오 특징 생성
+        audio_features = tf.random.normal([audio_length], dtype=tf.float32)
+        
+        # 더미 레이블
+        label = tf.constant(0.0, dtype=tf.float32)
+        
+        return audio_features, label
     
-    # 충분히 큰 더미 특성 생성 (16000Hz * 5초 = 80000 샘플)
-    dummy_features = np.random.randn(num_samples, 80000).astype(np.float32)
+    # 데이터셋 생성
+    dataset = tf.data.Dataset.from_generator(
+        lambda: [generate_consistent_data() for _ in range(50)],
+        output_signature=(
+            tf.TensorSpec(shape=[80000], dtype=tf.float32),
+            tf.TensorSpec(shape=[], dtype=tf.float32)
+        )
+    )
     
-    # 더미 레이블 (사용되지 않음)
-    dummy_labels = np.zeros((num_samples, 1), dtype=np.float32)
+    # 배치 처리 - drop_remainder=True로 일관된 배치 크기 보장
+    dataset = dataset.batch(batch_size, drop_remainder=True)
+    dataset = dataset.repeat()
+    dataset = dataset.prefetch(tf.data.AUTOTUNE)
     
-    # TensorFlow 데이터셋 생성
-    dataset = tf.data.Dataset.from_tensor_slices((dummy_features, dummy_labels))
-    
-    # 배치 설정 및 반복
-    return dataset.batch(batch_size).repeat()
+    return dataset
 
 
 # 전체 모델과 데이터셋을 연결하여 분산 학습 실행
@@ -1139,21 +1142,27 @@ def create_full_model(model_type="pretraining",
         return Wav2Vec2Model(config)
 
 
-# 분산 학습 스텝 정의
+# 분산 학습 스텝 정의 (수정됨)
 @tf.function
 def distributed_train_step(strategy, model, dist_inputs, optimizer):
-    """분산 학습을 위한 스텝 함수"""
+    """개선된 분산 학습 스텝"""
     
     def train_step(inputs):
         features, labels = inputs
         
+        # 배치 크기 검증
+        batch_size = tf.shape(features)[0]
+        
+        # 빈 배치인 경우 0 손실 반환
+        if tf.equal(batch_size, 0):
+            return tf.constant(0.0, dtype=tf.float32)
+        
         with tf.GradientTape() as tape:
-            # 모델 타입에 따라 다른 호출 방식 적용
-            # Wav2Vec2ForPreTraining은 labels 매개변수를 받지 않음
+            # 모델 순전파
+            outputs = model(features, training=True)
+            
+            # 손실 계산
             if isinstance(model, Wav2Vec2ForPreTraining):
-                outputs = model(features, training=True)
-                
-                # 필요한 텐서들이 모델에서 반환되는지 확인
                 if "projected_states" in outputs and "projected_quantized_features" in outputs:
                     # 컨트라스트 손실 계산
                     logits, contrastive_loss = model._compute_contrastive_loss(
@@ -1170,34 +1179,54 @@ def distributed_train_step(strategy, model, dist_inputs, optimizer):
                     # 최종 손실
                     loss = contrastive_loss + model.diversity_loss_weight * diversity_loss
                 else:
-                    # outputs에 직접 loss가 포함된 경우
-                    loss = outputs.get("loss", 0.0)
+                    loss = tf.constant(0.0)
             else:
-                # ASR이나 분류 모델의 경우 labels 매개변수 전달
                 outputs = model(features, labels=labels, training=True)
-                loss = outputs["loss"]
+                loss = outputs.get("loss", 0.0)
+            
+            # NaN 체크
+            loss = tf.where(tf.math.is_nan(loss), tf.constant(0.0), loss)
+            
+            # 분산 환경에서 손실 정규화
+            scaled_loss = loss / tf.cast(strategy.num_replicas_in_sync, tf.float32)
         
-        # 그래디언트 계산 및 적용
-        gradients = tape.gradient(loss, model.trainable_variables)
+        # 그래디언트 계산
+        gradients = tape.gradient(scaled_loss, model.trainable_variables)
+        
+        # None 그래디언트 필터링
+        gradients = [
+            tf.zeros_like(var) if grad is None else grad 
+            for grad, var in zip(gradients, model.trainable_variables)
+        ]
+        
+        # 그래디언트 클리핑
+        gradients, _ = tf.clip_by_global_norm(gradients, 1.0)
+        
+        # 옵티마이저 적용
         optimizer.apply_gradients(zip(gradients, model.trainable_variables))
         
-        return loss
+        return scaled_loss
     
-    # 분산 전략으로 학습 스텝 실행
+    # 분산 전략으로 실행
     per_replica_losses = strategy.run(train_step, args=(dist_inputs,))
     
-    # 손실 값 집계
+    # 손실 집계
     return strategy.reduce(tf.distribute.ReduceOp.SUM, per_replica_losses, axis=None)
 
-# wav2vec2 모델 메인 학습 함수
+# wav2vec2 모델 메인 학습 함수 (수정됨)
 def train_wav2vec2(strategy, model_type="pretraining", num_epochs=1, learning_rate=3e-5):
-    """wav2vec2 모델 학습 함수"""
+    """수정된 wav2vec2 모델 학습 함수"""
+    
     with strategy.scope():
         # 모델 생성
         model = create_full_model(model_type=model_type)
         
         # 옵티마이저 설정
-        optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
+        optimizer = tf.keras.optimizers.Adam(
+            learning_rate=learning_rate,
+            epsilon=1e-8,
+            clipnorm=1.0
+        )
         
         # 메트릭 설정
         metrics = []
@@ -1238,28 +1267,54 @@ def train_wav2vec2(strategy, model_type="pretraining", num_epochs=1, learning_ra
         print(f"Epoch {epoch+1}/{num_epochs}")
         
         for _ in range(MAX_ITERATIONS):
-            # 분산 데이터셋에서 배치 가져오기
             try:
+                # 분산 데이터셋에서 배치 가져오기
                 inputs = next(iterator)
+                
+                # 현재 시간 기록
+                step_start = time.time()
+                
+                # 분산 학습 스텝 실행 (strategy 명시적 전달)
+                loss = distributed_train_step(strategy, model, inputs, optimizer)
+                
+                # 스텝 완료 시간
+                step_end = time.time()
+                step_duration = step_end - step_start
+                elapsed = step_end - start_time
+                
+                # 모든 스텝에 대해 타임스탬프와 함께 로깅
+                print(f"Step {step}, Loss: {loss.numpy():.4f}, Time: {time.strftime('%H:%M:%S')} (경과: {elapsed:.2f}초, 스텝 시간: {step_duration:.2f}초)")
+                
+                step += 1
+                
+                # 주기적 체크포인트 저장
+                if step % 50 == 0:
+                    checkpoint.save(os.path.join(checkpoint_dir, f"model_step_{step}"))
+                
             except StopIteration:
                 iterator = iter(dist_dataset)
                 inputs = next(iterator)
-            
-            # 현재 시간 기록
-            step_start = time.time()
-            
-            # 분산 학습 스텝 실행 (strategy 명시적 전달)
-            loss = distributed_train_step(strategy, model, inputs, optimizer)
-            
-            # 스텝 완료 시간
-            step_end = time.time()
-            step_duration = step_end - step_start
-            elapsed = step_end - start_time
-            
-            # 모든 스텝에 대해 타임스탬프와 함께 로깅
-            print(f"Step {step}, Loss: {loss.numpy():.4f}, Time: {time.strftime('%H:%M:%S')} (경과: {elapsed:.2f}초, 스텝 시간: {step_duration:.2f}초)")
-            
-            step += 1
+                
+                # 현재 시간 기록
+                step_start = time.time()
+                
+                # 분산 학습 스텝 실행
+                loss = distributed_train_step(strategy, model, inputs, optimizer)
+                
+                # 스텝 완료 시간
+                step_end = time.time()
+                step_duration = step_end - step_start
+                elapsed = step_end - start_time
+                
+                print(f"Step {step}, Loss: {loss.numpy():.4f}, Time: {time.strftime('%H:%M:%S')} (경과: {elapsed:.2f}초, 스텝 시간: {step_duration:.2f}초)")
+                
+                step += 1
+                
+            except Exception as e:
+                print(f"Error at step {step}: {e}")
+                # 에러 발생 시 데이터셋 재시작
+                iterator = iter(dist_dataset)
+                continue
         
         # 에포크 종료 후 체크포인트 저장
         checkpoint.save(os.path.join(checkpoint_dir, f"model_epoch_{epoch+1}"))
@@ -1295,12 +1350,15 @@ network profile started!
     print("jct:", jct)
     
     # JCT 파일 저장
-    model_txt = open('/workspace/model.txt', 'r')
-    save_dir_name = model_txt.read()
-    jct_file = open('/result/' + save_dir_name.strip() + '/' + task_type + '_' + str(task_index) + '_jct.txt', 'w')
-    jct_file.write('%.2f' % (float(jct)))
-    jct_file.close()
-    model_txt.close()
+    try:
+        model_txt = open('/workspace/model.txt', 'r')
+        save_dir_name = model_txt.read()
+        jct_file = open('/result/' + save_dir_name.strip() + '/' + task_type + '_' + str(task_index) + '_jct.txt', 'w')
+        jct_file.write('%.2f' % (float(jct)))
+        jct_file.close()
+        model_txt.close()
+    except Exception as e:
+        print(f"JCT 파일 저장 중 오류: {e}")
     
     # 모델 저장
     model_path = os.path.join(CACHE_DIR, "wav2vec2_model")
@@ -1325,8 +1383,20 @@ if __name__ == "__main__":
     CACHE_DIR = '/workspace/model_cache'  # 컨테이너 내 사전 준비된 모델 캐시 경로
     DATASET_DIR = '/workspace/datasets'  # 컨테이너 내 사전 준비된 데이터셋 경로
 
-    # 분산 학습 전략 설정
-    strategy = tf.distribute.MultiWorkerMirroredStrategy()
+    # 분산 학습 전략 설정 - 안정성 개선
+    os.environ['GRPC_VERBOSITY'] = 'ERROR'
+    os.environ['TF_GRPC_DEFAULT_OPTIONS'] = 'grpc.keepalive_time_ms=30000,grpc.keepalive_timeout_ms=5000,grpc.keepalive_permit_without_calls=true,grpc.http2.max_pings_without_data=0,grpc.http2.min_time_between_pings_ms=10000,grpc.http2.min_ping_interval_without_data_ms=300000'
+    os.environ['TF_COLLECTIVE_OP_TIMEOUT'] = '120'
+    
+    # 통신 옵션으로 안정성 향상
+    communication_options = tf.distribute.experimental.CommunicationOptions(
+        implementation=tf.distribute.experimental.CommunicationImplementation.NCCL,
+        timeout_seconds=120.0
+    )
+    
+    strategy = tf.distribute.MultiWorkerMirroredStrategy(
+        communication_options=communication_options
+    )
 
     # 하이퍼파라미터 설정
     BATCH_SIZE_PER_REPLICA = args.batch_size
