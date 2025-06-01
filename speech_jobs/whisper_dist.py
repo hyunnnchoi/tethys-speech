@@ -2,728 +2,1023 @@ import tensorflow as tf
 import numpy as np
 import json
 import os
+import sys
 import time
 import argparse
-from tensorflow.keras import layers, Model
 
 
-class WhisperConfig:
+class Wav2Vec2Config:
     def __init__(self):
-        # 모델 크기 설정 (Whisper-small 기준)
-        self.d_model = 768  # 모델 차원
-        self.encoder_layers = 4  # 인코더 레이어 수
-        self.encoder_attention_heads = 12  # 인코더 어텐션 헤드 수
-        self.decoder_layers = 4  # 디코더 레이어 수
-        self.decoder_attention_heads = 12  # 디코더 어텐션 헤드 수
-        self.d_ff = 3072  # 피드포워드 네트워크 차원
+        # 특징 추출기 설정
+        self.feat_extract_norm = "group"
+        self.feat_extract_activation = "gelu"
+        self.conv_dim = [512, 512, 512, 512, 512, 512, 512]
+        self.conv_stride = [5, 2, 2, 2, 2, 2, 2]
+        self.conv_kernel = [10, 3, 3, 3, 3, 2, 2]
+        self.conv_bias = False
+        self.num_conv_pos_embeddings = 128
+        self.num_conv_pos_embedding_groups = 16
         
-        # 인코더 설정
-        self.n_mels = 80  # 멜 스펙트로그램 특징 수
-        self.n_ctx = 1500  # 최대 컨텍스트 길이 (30초 오디오)
-        
-        # 디코더 설정
-        self.vocab_size = 51865  # 전체 어휘 크기
-        self.max_target_positions = 448  # 최대 출력 시퀀스 길이
-        
-        # 학습 관련 설정
-        self.dropout = 0.1
+        # 모델 차원 및 인코더 설정
+        self.hidden_size = 768
+        self.num_hidden_layers = 12
+        self.num_attention_heads = 12
+        self.intermediate_size = 3072
+        self.hidden_act = "gelu"
+        self.hidden_dropout = 0.1
+        self.activation_dropout = 0.1
         self.attention_dropout = 0.1
-        self.activation_dropout = 0.0
-        self.activation_function = "gelu"
-        
-        # 기타 설정
         self.layer_norm_eps = 1e-5
-        self.init_std = 0.02
         
-        # 특수 토큰 설정
-        self.pad_token_id = 0
-        self.bos_token_id = 1
-        self.eos_token_id = 2
+        # 양자화 및 마스킹 설정
+        self.num_codevectors_per_group = 320
+        self.num_codevector_groups = 2
+        self.contrastive_logits_temperature = 0.1
+        self.num_negatives = 100
+        self.codevector_dim = 256
+        self.proj_codevector_dim = 256
+        self.diversity_loss_weight = 0.1
+        self.ctc_loss_reduction = "sum"
+        self.ctc_zero_infinity = False
+        
+        # 미세 조정 설정
+        self.mask_time_prob = 0.05
+        self.mask_time_length = 10
+        self.mask_feature_prob = 0.0
+        self.mask_feature_length = 10
         
         # 추가 설정
-        self.use_cache = True
-        self.decoder_start_token_id = 50257  # <|startoftranscript|>
+        self.vocab_size = 32
+        self.do_stable_layer_norm = True
+        self.use_weighted_layer_sum = False
+        self.classifier_proj_size = 256
+        self.tdnn_dim = [512, 512, 512, 512, 1500]
+        self.tdnn_kernel = [5, 3, 3, 1, 1]
+        self.tdnn_dilation = [1, 2, 3, 1, 1]
+        self.xvector_output_dim = 512
 
 
-# 위치 인코딩
-class PositionalEncoding(tf.keras.layers.Layer):
-    def __init__(self, d_model, max_len=5000):
-        super(PositionalEncoding, self).__init__()
-        self.d_model = d_model
-        
-        # 위치 인코딩 행렬 계산
-        pe = np.zeros((max_len, d_model))
-        position = np.arange(0, max_len)[:, np.newaxis]
-        div_term = np.exp(np.arange(0, d_model, 2) * -(np.log(10000.0) / d_model))
-        
-        # 짝수 인덱스에는 sin, 홀수 인덱스에는 cos
-        pe[:, 0::2] = np.sin(position * div_term)
-        pe[:, 1::2] = np.cos(position * div_term)
-        
-        self.pe = tf.convert_to_tensor(pe, dtype=tf.float32)
-        self.pe = tf.expand_dims(self.pe, 0)  # [1, max_len, d_model]
+# Gelu 활성화 함수 정의
+def gelu(x):
+    """
+    Gaussian Error Linear Unit 활성화 함수
+    """
+    return 0.5 * x * (1.0 + tf.math.erf(x / tf.math.sqrt(2.0)))
+
+
+# 그룹 정규화 레이어
+class GroupNormalization(tf.keras.layers.Layer):
+    def __init__(self, groups=32, axis=-1, epsilon=1e-5):
+        super(GroupNormalization, self).__init__()
+        self.groups = groups
+        self.axis = axis
+        self.epsilon = epsilon
     
-    def call(self, x):
-        # x: [batch_size, seq_len, d_model]
-        seq_len = tf.shape(x)[1]
-        return x + self.pe[:, :seq_len, :]
-
-
-# 멀티헤드 어텐션 구현
-class MultiHeadAttention(tf.keras.layers.Layer):
-    def __init__(self, config, is_decoder=False, is_cross_attention=False):
-        super(MultiHeadAttention, self).__init__()
-        self.is_decoder = is_decoder
-        self.is_cross_attention = is_cross_attention
+    def build(self, input_shape):
+        dim = input_shape[self.axis]
+        if dim is None:
+            raise ValueError('Dimension of axis {} must be known'.format(self.axis))
+        if dim % self.groups != 0:
+            raise ValueError('Dimension of axis {} must be divisible by groups {}'.format(
+                self.axis, self.groups))
         
-        if is_decoder:
-            self.num_heads = config.decoder_attention_heads
-            self.d_model = config.d_model
-        else:
-            self.num_heads = config.encoder_attention_heads
-            self.d_model = config.d_model
-            
-        self.head_dim = self.d_model // self.num_heads
-        self.scaling = self.head_dim ** -0.5
+        self.gamma = self.add_weight(
+            name='gamma',
+            shape=(dim,),
+            initializer='ones',
+            trainable=True)
         
-        self.k_proj = tf.keras.layers.Dense(self.d_model, use_bias=True)
-        self.v_proj = tf.keras.layers.Dense(self.d_model, use_bias=True)
-        self.q_proj = tf.keras.layers.Dense(self.d_model, use_bias=True)
-        self.out_proj = tf.keras.layers.Dense(self.d_model, use_bias=True)
-        
-        self.dropout = tf.keras.layers.Dropout(config.attention_dropout)
+        self.beta = self.add_weight(
+            name='beta',
+            shape=(dim,),
+            initializer='zeros',
+            trainable=True)
     
-    def _reshape(self, x):
-        batch_size = tf.shape(x)[0]
-        seq_len = tf.shape(x)[1]
+    def call(self, inputs):
+        input_shape = tf.shape(inputs)
+        reshaped_inputs = self._reshape_into_groups(inputs)
         
-        # [batch_size, seq_len, d_model] -> [batch_size, seq_len, num_heads, head_dim]
-        x = tf.reshape(x, (batch_size, seq_len, self.num_heads, self.head_dim))
+        normalized_inputs = self._apply_normalization(reshaped_inputs, input_shape)
         
-        # [batch_size, seq_len, num_heads, head_dim] -> [batch_size, num_heads, seq_len, head_dim]
-        return tf.transpose(x, perm=[0, 2, 1, 3])
+        return tf.reshape(normalized_inputs, input_shape)
     
-    def call(self, hidden_states, key_value_states=None, attention_mask=None, 
-             past_key_value=None, layer_head_mask=None, training=False):
-        """
-        hidden_states: 쿼리 텐서 [batch_size, seq_len, d_model]
-        key_value_states: 키/값 텐서 (cross-attention 사용 시) [batch_size, kv_seq_len, d_model]
-        attention_mask: 어텐션 마스크 [batch_size, seq_len, kv_seq_len]
-        past_key_value: 캐싱된 키/값 (디코더에서 사용)
-        """
-        batch_size = tf.shape(hidden_states)[0]
-        seq_len = tf.shape(hidden_states)[1]
+    def _reshape_into_groups(self, inputs):
+        input_shape = tf.shape(inputs)
+        group_shape = [input_shape[0], input_shape[1], self.groups, input_shape[2] // self.groups]
         
-        # cross-attention인 경우 key, value는 인코더 출력, query는 디코더 상태
-        is_cross_attention = key_value_states is not None
+        # [batch, time, features] -> [batch, time, groups, features_per_group]
+        group_shaped_inputs = tf.reshape(inputs, group_shape)
         
-        if is_cross_attention:
-            # cross-attention인 경우 key_value_states에서 key와 value 추출
-            key_states = self._reshape(self.k_proj(key_value_states))  # [batch, num_heads, kv_seq_len, head_dim]
-            value_states = self._reshape(self.v_proj(key_value_states))  # [batch, num_heads, kv_seq_len, head_dim]
-            kv_seq_len = tf.shape(key_states)[2]
-        elif past_key_value is not None:
-            # 과거 키/값이 있는 경우 (디코더의 auto-regressive 생성 시)
-            key_states = self._reshape(self.k_proj(hidden_states))  # [batch, num_heads, seq_len, head_dim]
-            value_states = self._reshape(self.v_proj(hidden_states))  # [batch, num_heads, seq_len, head_dim]
-            
-            # 과거 키/값과 현재 키/값 연결
-            key_states = tf.concat([past_key_value[0], key_states], axis=2)
-            value_states = tf.concat([past_key_value[1], value_states], axis=2)
-            kv_seq_len = tf.shape(key_states)[2]
-        else:
-            # 일반적인 self-attention
-            key_states = self._reshape(self.k_proj(hidden_states))  # [batch, num_heads, seq_len, head_dim]
-            value_states = self._reshape(self.v_proj(hidden_states))  # [batch, num_heads, seq_len, head_dim]
-            kv_seq_len = seq_len
+        # [batch, time, groups, features_per_group] -> [batch, time, features_per_group, groups]
+        return tf.transpose(group_shaped_inputs, [0, 1, 3, 2])
+    
+    def _apply_normalization(self, reshaped_inputs, input_shape):
+        # 평균과 분산 계산
+        mean, variance = tf.nn.moments(reshaped_inputs, [1, 2], keepdims=True)
+        # 정규화
+        normalized_inputs = (reshaped_inputs - mean) / tf.sqrt(variance + self.epsilon)
         
-        # 항상 쿼리는 현재 hidden_states에서 계산
-        query_states = self._reshape(self.q_proj(hidden_states) * self.scaling)  # [batch, num_heads, seq_len, head_dim]
+        # 원래 형태로 복원
+        normalized_inputs = tf.transpose(normalized_inputs, [0, 1, 3, 2])
+        normalized_inputs = tf.reshape(normalized_inputs, input_shape)
         
-        # 현재 키/값 저장 (디코더에서 캐싱 시 사용)
-        past_key_value = (key_states, value_states) if self.is_decoder else None
-        
-        # 어텐션 스코어 계산: [batch, num_heads, seq_len, kv_seq_len]
-        attention_scores = tf.matmul(query_states, key_states, transpose_b=True)
-        
-        # 어텐션 마스크 적용 (존재하는 경우)
-        if attention_mask is not None:
-            # 마스크 확장 및 적용 (마스크가 0인 위치는 -inf로 설정)
-            attention_mask = tf.cast(attention_mask, tf.float32)
-            attention_mask = (1.0 - attention_mask) * -1e9
-            attention_scores = attention_scores + attention_mask
-        
-        # 소프트맥스 적용
-        attention_probs = tf.nn.softmax(attention_scores, axis=-1)
-        
-        # 드롭아웃 적용
-        attention_probs = self.dropout(attention_probs, training=training)
-        
-        # 헤드 마스크 적용 (필요한 경우)
-        if layer_head_mask is not None:
-            attention_probs = attention_probs * tf.expand_dims(tf.expand_dims(layer_head_mask, -1), -1)
-        
-        # 어텐션 출력 계산
-        attention_output = tf.matmul(attention_probs, value_states)  # [batch, num_heads, seq_len, head_dim]
-        
-        # 출력 형태 변환
-        attention_output = tf.transpose(attention_output, perm=[0, 2, 1, 3])  # [batch, seq_len, num_heads, head_dim]
-        attention_output = tf.reshape(attention_output, (batch_size, seq_len, self.d_model))  # [batch, seq_len, d_model]
-        
-        # 최종 선형 변환
-        attention_output = self.out_proj(attention_output)
-        
-        return attention_output, attention_probs, past_key_value
+        # 스케일 및 시프트 적용
+        return self.gamma * normalized_inputs + self.beta
 
 
-# 피드포워드 네트워크
-class FeedForward(tf.keras.layers.Layer):
-    def __init__(self, config, is_decoder=False):
-        super(FeedForward, self).__init__()
-        if is_decoder:
-            d_model = config.d_model
-            d_ff = config.d_ff
-            dropout = config.dropout
-            activation_dropout = config.activation_dropout
-        else:
-            d_model = config.d_model
-            d_ff = config.d_ff
-            dropout = config.dropout
-            activation_dropout = config.activation_dropout
-        
-        self.fc1 = tf.keras.layers.Dense(d_ff, use_bias=True)
-        self.activation_fn = tf.keras.activations.gelu
-        self.activation_dropout = tf.keras.layers.Dropout(activation_dropout)
-        self.fc2 = tf.keras.layers.Dense(d_model, use_bias=True)
-        self.dropout = tf.keras.layers.Dropout(dropout)
+# 상대적 위치 임베딩 레이어
+class RelativePositionalEncoding(tf.keras.layers.Layer):
+    def __init__(self, dim, max_length=5000):
+        super(RelativePositionalEncoding, self).__init__()
+        self.dim = dim
+        pe = self._get_pos_encoding(max_length, dim)
+        self.pos_embedding = tf.Variable(
+            initial_value=pe,
+            trainable=True,
+            dtype=tf.float32,
+            name="pos_embedding"
+        )
     
-    def call(self, hidden_states, training=False):
-        hidden_states = self.fc1(hidden_states)
-        hidden_states = self.activation_fn(hidden_states)
-        hidden_states = self.activation_dropout(hidden_states, training=training)
-        hidden_states = self.fc2(hidden_states)
+    def _get_pos_encoding(self, max_length, d_model):
+        # 위치 임베딩 초기화
+        pos_enc = np.zeros((max_length, d_model))
+        for pos in range(max_length):
+            for i in range(0, d_model, 2):
+                pos_enc[pos, i] = np.sin(pos / (10000 ** (i / d_model)))
+                if i + 1 < d_model:
+                    pos_enc[pos, i + 1] = np.cos(pos / (10000 ** (i / d_model)))
+        return pos_enc
+    
+    def call(self, length):
+        return self.pos_embedding[:length]
+
+
+# ============ 기본 모델 컴포넌트 ============ #
+
+# 특징 추출기 (Feature Extractor) 구현
+class Wav2Vec2FeatureExtractor(tf.keras.layers.Layer):
+    def __init__(self, config):
+        super(Wav2Vec2FeatureExtractor, self).__init__()
+        self.config = config
+        
+        # 컨볼루션 레이어 스택 생성
+        self.conv_layers = []
+        
+        # 첫 번째 컨볼루션 레이어
+        self.conv_layers.append(
+            tf.keras.Sequential([
+                tf.keras.layers.Conv1D(
+                    filters=config.conv_dim[0],
+                    kernel_size=config.conv_kernel[0],
+                    strides=config.conv_stride[0],
+                    padding="same",
+                    use_bias=config.conv_bias,
+                    name="conv_0"
+                ),
+                GroupNormalization(groups=self.config.num_conv_pos_embedding_groups) if config.feat_extract_norm == "group" else tf.keras.layers.LayerNormalization(epsilon=1e-5),
+                tf.keras.layers.Activation(gelu if config.feat_extract_activation == "gelu" else "relu")
+            ])
+        )
+        
+        # 나머지 컨볼루션 레이어 추가
+        for i in range(1, len(config.conv_dim)):
+            self.conv_layers.append(
+                tf.keras.Sequential([
+                    tf.keras.layers.Conv1D(
+                        filters=config.conv_dim[i],
+                        kernel_size=config.conv_kernel[i],
+                        strides=config.conv_stride[i],
+                        padding="same",
+                        use_bias=config.conv_bias,
+                        name=f"conv_{i}"
+                    ),
+                    GroupNormalization(groups=self.config.num_conv_pos_embedding_groups) if config.feat_extract_norm == "group" else tf.keras.layers.LayerNormalization(epsilon=1e-5),
+                    tf.keras.layers.Activation(gelu if config.feat_extract_activation == "gelu" else "relu")
+                ])
+            )
+        
+        # 위치 인코딩 레이어
+        self.pos_conv_embed = tf.keras.layers.Conv1D(
+            filters=config.conv_dim[-1],
+            kernel_size=config.num_conv_pos_embeddings,
+            padding="same",
+            groups=config.num_conv_pos_embedding_groups,
+            name="pos_conv_embed"
+        )
+        
+        # 레이어 정규화
+        self.layer_norm = tf.keras.layers.LayerNormalization(epsilon=config.layer_norm_eps)
+        self.dropout = tf.keras.layers.Dropout(config.hidden_dropout)
+    
+    def call(self, inputs, training=False):
+        hidden_states = tf.expand_dims(inputs, axis=-1)  # [batch, time] -> [batch, time, 1]
+        
+        # 컨볼루션 레이어 통과
+        for conv_layer in self.conv_layers:
+            hidden_states = conv_layer(hidden_states, training=training)
+        
+        # 위치 인코딩 추가
+        position_embeddings = self.pos_conv_embed(hidden_states)
+        
+        # 합산 및 정규화
+        hidden_states = hidden_states + position_embeddings
+        hidden_states = self.layer_norm(hidden_states)
         hidden_states = self.dropout(hidden_states, training=training)
+        
         return hidden_states
 
 
-# 인코더 레이어
-class WhisperEncoderLayer(tf.keras.layers.Layer):
+# MultiHeadAttention 구현
+class Wav2Vec2MultiHeadAttention(tf.keras.layers.Layer):
     def __init__(self, config):
-        super(WhisperEncoderLayer, self).__init__()
-        self.self_attn = MultiHeadAttention(config, is_decoder=False)
-        self.self_attn_layer_norm = tf.keras.layers.LayerNormalization(epsilon=config.layer_norm_eps)
-        self.feed_forward = FeedForward(config, is_decoder=False)
-        self.final_layer_norm = tf.keras.layers.LayerNormalization(epsilon=config.layer_norm_eps)
-    
-    def call(self, hidden_states, attention_mask=None, layer_head_mask=None, training=False):
-        # Self Attention
-        residual = hidden_states
-        hidden_states = self.self_attn_layer_norm(hidden_states)
-        attention_output, attention_weights, _ = self.self_attn(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            layer_head_mask=layer_head_mask,
-            training=training
-        )
-        hidden_states = residual + attention_output
-        
-        # Feed Forward
-        residual = hidden_states
-        hidden_states = self.final_layer_norm(hidden_states)
-        feed_forward_output = self.feed_forward(hidden_states, training=training)
-        hidden_states = residual + feed_forward_output
-        
-        return hidden_states, attention_weights
-
-
-# 디코더 레이어
-class WhisperDecoderLayer(tf.keras.layers.Layer):
-    def __init__(self, config):
-        super(WhisperDecoderLayer, self).__init__()
-        # Self Attention
-        self.self_attn = MultiHeadAttention(config, is_decoder=True)
-        self.self_attn_layer_norm = tf.keras.layers.LayerNormalization(epsilon=config.layer_norm_eps)
-        
-        # Cross Attention
-        self.encoder_attn = MultiHeadAttention(config, is_decoder=True, is_cross_attention=True)
-        self.encoder_attn_layer_norm = tf.keras.layers.LayerNormalization(epsilon=config.layer_norm_eps)
-        
-        # Feed Forward
-        self.feed_forward = FeedForward(config, is_decoder=True)
-        self.final_layer_norm = tf.keras.layers.LayerNormalization(epsilon=config.layer_norm_eps)
-    
-    def call(self, hidden_states, encoder_hidden_states, 
-             attention_mask=None, encoder_attention_mask=None,
-             layer_head_mask=None, cross_attn_layer_head_mask=None,
-             past_key_value=None, training=False):
-        
-        # 캐시된 과거 키/값 분리
-        self_attn_past_key_value = past_key_value[:2] if past_key_value is not None else None
-        cross_attn_past_key_value = past_key_value[2:] if past_key_value is not None else None
-        
-        # Self Attention
-        residual = hidden_states
-        hidden_states = self.self_attn_layer_norm(hidden_states)
-        
-        attention_output, self_attention_weights, present_key_value = self.self_attn(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            layer_head_mask=layer_head_mask,
-            past_key_value=self_attn_past_key_value,
-            training=training
-        )
-        
-        hidden_states = residual + attention_output
-        
-        # Cross Attention
-        residual = hidden_states
-        hidden_states = self.encoder_attn_layer_norm(hidden_states)
-        
-        cross_attention_output, cross_attention_weights, cross_attn_present_key_value = self.encoder_attn(
-            hidden_states=hidden_states,
-            key_value_states=encoder_hidden_states,
-            attention_mask=encoder_attention_mask,
-            layer_head_mask=cross_attn_layer_head_mask,
-            training=training
-        )
-        
-        hidden_states = residual + cross_attention_output
-        
-        # Feed Forward
-        residual = hidden_states
-        hidden_states = self.final_layer_norm(hidden_states)
-        feed_forward_output = self.feed_forward(hidden_states, training=training)
-        hidden_states = residual + feed_forward_output
-        
-        # 현재 레이어의 키/값 모음
-        present_key_value = present_key_value + cross_attn_present_key_value if present_key_value is not None else None
-        
-        return hidden_states, self_attention_weights, cross_attention_weights, present_key_value
-
-
-# 오디오 인코더
-class WhisperEncoder(tf.keras.layers.Layer):
-    def __init__(self, config):
-        super(WhisperEncoder, self).__init__()
+        super(Wav2Vec2MultiHeadAttention, self).__init__()
         self.config = config
+        self.embed_dim = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.head_dim = self.embed_dim // self.num_heads
         
-        # 오디오 특징 추출 및 임베딩
-        self.conv1 = tf.keras.layers.Conv1D(config.d_model, kernel_size=3, strides=1, padding="same")
-        self.conv2 = tf.keras.layers.Conv1D(config.d_model, kernel_size=3, strides=2, padding="same")
-        self.positional_embedding = PositionalEncoding(config.d_model, config.n_ctx)
+        if self.head_dim * self.num_heads != self.embed_dim:
+            raise ValueError(
+                f"embed_dim must be divisible by num_heads (got `embed_dim`: {self.embed_dim} and `num_heads`: {self.num_heads})."
+            )
         
-        # 드롭아웃
-        self.dropout = tf.keras.layers.Dropout(config.dropout)
+        # 어텐션 프로젝션 레이어
+        self.q_proj = tf.keras.layers.Dense(self.embed_dim, use_bias=True, name="q_proj")
+        self.k_proj = tf.keras.layers.Dense(self.embed_dim, use_bias=True, name="k_proj")
+        self.v_proj = tf.keras.layers.Dense(self.embed_dim, use_bias=True, name="v_proj")
+        self.out_proj = tf.keras.layers.Dense(self.embed_dim, use_bias=True, name="out_proj")
         
-        # 인코더 레이어
-        self.layers = [WhisperEncoderLayer(config) for _ in range(config.encoder_layers)]
-        
-        # 레이어 정규화
-        self.layer_norm = tf.keras.layers.LayerNormalization(epsilon=config.layer_norm_eps)
+        self.dropout = tf.keras.layers.Dropout(config.attention_dropout)
     
-    def call(self, input_features, attention_mask=None, layer_head_mask=None, training=False):
-        """
-        input_features: 멜 스펙트로그램 특징 [batch_size, n_mels, seq_len]
-        """
-        # 차원 변환 (채널 마지막)
-        input_features = tf.transpose(input_features, perm=[0, 2, 1])  # [batch, seq_len, n_mels]
+    def _reshape_for_multihead_attention(self, x):
+        batch_size = tf.shape(x)[0]
+        seq_length = tf.shape(x)[1]
         
-        # 컨볼루션 레이어 적용
-        hidden_states = self.conv1(input_features)
-        hidden_states = tf.keras.activations.gelu(hidden_states)
+        # [batch, time, embed_dim] -> [batch, time, num_heads, head_dim]
+        reshaped = tf.reshape(x, (batch_size, seq_length, self.num_heads, self.head_dim))
         
-        hidden_states = self.conv2(hidden_states)
-        hidden_states = tf.keras.activations.gelu(hidden_states)
+        # [batch, time, num_heads, head_dim] -> [batch, num_heads, time, head_dim]
+        return tf.transpose(reshaped, perm=[0, 2, 1, 3])
+    
+    def call(self, hidden_states, attention_mask=None, output_attentions=False, training=False):
+        batch_size = tf.shape(hidden_states)[0]
+        seq_length = tf.shape(hidden_states)[1]
         
-        # 위치 인코딩 추가
-        hidden_states = self.positional_embedding(hidden_states)
+        # 선형 투영
+        query_states = self.q_proj(hidden_states)  # [batch, time, embed_dim]
+        key_states = self.k_proj(hidden_states)    # [batch, time, embed_dim]
+        value_states = self.v_proj(hidden_states)  # [batch, time, embed_dim]
         
-        # 드롭아웃
-        hidden_states = self.dropout(hidden_states, training=training)
+        # 다중 헤드 형태로 변환
+        query_states = self._reshape_for_multihead_attention(query_states)  # [batch, num_heads, time, head_dim]
+        key_states = self._reshape_for_multihead_attention(key_states)      # [batch, num_heads, time, head_dim]
+        value_states = self._reshape_for_multihead_attention(value_states)  # [batch, num_heads, time, head_dim]
         
-        # 레이어별 처리
-        all_hidden_states = ()
-        all_self_attentions = ()
+        # QK^T 계산
+        attention_scores = tf.matmul(query_states, key_states, transpose_b=True)  # [batch, num_heads, time, time]
+        attention_scores = attention_scores / tf.math.sqrt(tf.cast(self.head_dim, tf.float32))
         
-        for i, layer in enumerate(self.layers):
-            all_hidden_states = all_hidden_states + (hidden_states,)
-            
-            # 레이어 헤드 마스크 가져오기
-            layer_head_mask_i = layer_head_mask[i] if layer_head_mask is not None else None
-            
-            # 레이어 호출
-            hidden_states, self_attn_weights = layer(
-                hidden_states,
+        # 어텐션 마스크 적용 (필요한 경우)
+        if attention_mask is not None:
+            # 마스크를 [batch, 1, 1, time] 형태로 변환하여 브로드캐스팅 활용
+            attention_mask = tf.expand_dims(tf.expand_dims(attention_mask, 1), 1)
+            attention_scores = attention_scores + (1.0 - attention_mask) * -10000.0
+        
+        # 소프트맥스 적용
+        attention_probs = tf.nn.softmax(attention_scores, axis=-1)
+        attention_probs = self.dropout(attention_probs, training=training)
+        
+        # 값과 어텐션 가중치 결합
+        context_states = tf.matmul(attention_probs, value_states)  # [batch, num_heads, time, head_dim]
+        
+        # 형태 변환: [batch, num_heads, time, head_dim] -> [batch, time, num_heads, head_dim]
+        context_states = tf.transpose(context_states, perm=[0, 2, 1, 3])
+        
+        # 최종 형태로 변환: [batch, time, embed_dim]
+        context_states = tf.reshape(context_states, (batch_size, seq_length, self.embed_dim))
+        
+        # 최종 프로젝션
+        output = self.out_proj(context_states)
+        
+        # 어텐션 가중치 반환 (필요한 경우)
+        outputs = (output, attention_probs) if output_attentions else (output,)
+        
+        return outputs
+
+
+# FeedForward 네트워크 구현
+class Wav2Vec2FeedForward(tf.keras.layers.Layer):
+    def __init__(self, config):
+        super(Wav2Vec2FeedForward, self).__init__()
+        self.intermediate_dense = tf.keras.layers.Dense(config.intermediate_size, name="intermediate_dense")
+        self.intermediate_act_fn = gelu if config.hidden_act == "gelu" else tf.keras.activations.get(config.hidden_act)
+        self.intermediate_dropout = tf.keras.layers.Dropout(config.activation_dropout)
+        
+        self.output_dense = tf.keras.layers.Dense(config.hidden_size, name="output_dense")
+        self.output_dropout = tf.keras.layers.Dropout(config.hidden_dropout)
+    
+    def call(self, hidden_states, training=False):
+        hidden_states = self.intermediate_dense(hidden_states)
+        hidden_states = self.intermediate_act_fn(hidden_states)
+        hidden_states = self.intermediate_dropout(hidden_states, training=training)
+        
+        hidden_states = self.output_dense(hidden_states)
+        hidden_states = self.output_dropout(hidden_states, training=training)
+        
+        return hidden_states
+
+
+# Transformer 인코더 레이어 구현
+class Wav2Vec2EncoderLayer(tf.keras.layers.Layer):
+    def __init__(self, config):
+        super(Wav2Vec2EncoderLayer, self).__init__()
+        self.config = config
+        self.do_stable_layer_norm = config.do_stable_layer_norm
+        
+        # 어텐션 레이어
+        self.attention = Wav2Vec2MultiHeadAttention(config)
+        self.attention_dropout = tf.keras.layers.Dropout(config.hidden_dropout)
+        self.attention_layer_norm = tf.keras.layers.LayerNormalization(epsilon=config.layer_norm_eps)
+        
+        # 피드포워드 레이어
+        self.feed_forward = Wav2Vec2FeedForward(config)
+        self.feed_forward_layer_norm = tf.keras.layers.LayerNormalization(epsilon=config.layer_norm_eps)
+    
+    def call(self, hidden_states, attention_mask=None, output_attentions=False, training=False):
+        # self-attention 레이어
+        if self.do_stable_layer_norm:
+            # 레이어 정규화 후 어텐션
+            attention_input = self.attention_layer_norm(hidden_states)
+            attention_outputs = self.attention(
+                attention_input,
                 attention_mask=attention_mask,
-                layer_head_mask=layer_head_mask_i,
+                output_attentions=output_attentions,
                 training=training
             )
+            attention_output = attention_outputs[0]
             
-            all_self_attentions = all_self_attentions + (self_attn_weights,)
+            # 잔차 연결
+            attention_output = self.attention_dropout(attention_output, training=training)
+            hidden_states = hidden_states + attention_output
+            
+            # 레이어 정규화 후 피드포워드
+            feed_forward_input = self.feed_forward_layer_norm(hidden_states)
+            feed_forward_output = self.feed_forward(feed_forward_input, training=training)
+            
+            # 잔차 연결
+            hidden_states = hidden_states + feed_forward_output
+        else:
+            # 기존 방식: 어텐션 후 레이어 정규화
+            attention_outputs = self.attention(
+                hidden_states,
+                attention_mask=attention_mask,
+                output_attentions=output_attentions,
+                training=training
+            )
+            attention_output = attention_outputs[0]
+            
+            # 잔차 연결 및 레이어 정규화
+            attention_output = self.attention_dropout(attention_output, training=training)
+            hidden_states = self.attention_layer_norm(hidden_states + attention_output)
+            
+            # 피드포워드 및 정규화
+            feed_forward_output = self.feed_forward(hidden_states, training=training)
+            hidden_states = self.feed_forward_layer_norm(hidden_states + feed_forward_output)
         
-        # 최종 레이어 정규화
-        hidden_states = self.layer_norm(hidden_states)
+        outputs = (hidden_states,) + attention_outputs[1:] if output_attentions else (hidden_states,)
         
-        # 최종 결과 반환
+        return outputs
+
+
+# Transformer 인코더 구현
+class Wav2Vec2Encoder(tf.keras.layers.Layer):
+    def __init__(self, config):
+        super(Wav2Vec2Encoder, self).__init__()
+        self.config = config
+        self.layers = [Wav2Vec2EncoderLayer(config) for _ in range(config.num_hidden_layers)]
+        self.gradient_checkpointing = False
+        
+        # 가중치 합계를 위한 레이어 (필요한 경우)
+        self.layer_weights = None
+        if config.use_weighted_layer_sum:
+            self.layer_weights = tf.Variable(
+                initial_value=tf.ones(config.num_hidden_layers) / config.num_hidden_layers,
+                trainable=True,
+                dtype=tf.float32,
+                name="layer_weights"
+            )
+    
+    def call(self, 
+             hidden_states, 
+             attention_mask=None,
+             output_hidden_states=False, 
+             output_attentions=False, 
+             return_dict=True,
+             training=False):
+        all_hidden_states = () if output_hidden_states else None
+        all_attentions = () if output_attentions else None
+        
+        if self.config.use_weighted_layer_sum:
+            # 0번째 레이어 출력을 초기값으로 사용
+            layerwise_hidden_states = ()
+            for i, layer in enumerate(self.layers):
+                if output_hidden_states:
+                    all_hidden_states = all_hidden_states + (hidden_states,)
+                
+                # 정규화된 가중치 계산
+                layer_outputs = layer(
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    output_attentions=output_attentions,
+                    training=training
+                )
+                hidden_states = layer_outputs[0]
+                
+                layerwise_hidden_states = layerwise_hidden_states + (hidden_states,)
+                
+                if output_attentions:
+                    all_attentions = all_attentions + (layer_outputs[1],)
+            
+            # 가중치 정규화
+            norm_weights = tf.nn.softmax(self.layer_weights, axis=-1)
+            
+            # 정규화된 가중치로 각 레이어의 출력 가중합 계산
+            hidden_states = tf.stack(layerwise_hidden_states, axis=0)  # [num_layers, batch, time, hidden_size]
+            hidden_states = tf.einsum("l,lbth->bth", norm_weights, hidden_states)
+        else:
+            # 기본 구현: 각 레이어 순차적으로 통과
+            for i, layer in enumerate(self.layers):
+                if output_hidden_states:
+                    all_hidden_states = all_hidden_states + (hidden_states,)
+                
+                layer_outputs = layer(
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    output_attentions=output_attentions,
+                    training=training
+                )
+                hidden_states = layer_outputs[0]
+                
+                if output_attentions:
+                    all_attentions = all_attentions + (layer_outputs[1],)
+        
+        # 마지막 레이어 출력도 추가
+        if output_hidden_states:
+            all_hidden_states = all_hidden_states + (hidden_states,)
+        
+        if not return_dict:
+            return tuple(v for v in [hidden_states, all_hidden_states, all_attentions] if v is not None)
+        
         return {
             "last_hidden_state": hidden_states,
             "hidden_states": all_hidden_states,
-            "attentions": all_self_attentions
+            "attentions": all_attentions
         }
 
 
-# 텍스트 디코더
-class WhisperDecoder(tf.keras.layers.Layer):
+# 프로젝션 헤드 구현
+class Wav2Vec2ProjectionHead(tf.keras.layers.Layer):
     def __init__(self, config):
-        super(WhisperDecoder, self).__init__()
-        self.config = config
-        
-        # 토큰 임베딩
-        self.embed_tokens = tf.keras.layers.Embedding(config.vocab_size, config.d_model)
-        self.positional_embedding = PositionalEncoding(config.d_model, config.max_target_positions)
-        
-        # 드롭아웃
-        self.dropout = tf.keras.layers.Dropout(config.dropout)
-        
-        # 디코더 레이어
-        self.layers = [WhisperDecoderLayer(config) for _ in range(config.decoder_layers)]
-        
-        # 레이어 정규화
+        super(Wav2Vec2ProjectionHead, self).__init__()
+        self.dense = tf.keras.layers.Dense(config.proj_codevector_dim, name="projection_head")
         self.layer_norm = tf.keras.layers.LayerNormalization(epsilon=config.layer_norm_eps)
+        self.dropout = tf.keras.layers.Dropout(config.hidden_dropout)
     
-    def call(self, input_ids, encoder_hidden_states,
-             attention_mask=None, encoder_attention_mask=None,
-             layer_head_mask=None, cross_attn_layer_head_mask=None,
-             past_key_values=None, use_cache=False, training=False):
-        """
-        input_ids: 입력 토큰 ID [batch_size, seq_len]
-        encoder_hidden_states: 인코더 출력 [batch_size, enc_seq_len, d_model]
-        """
-        batch_size, seq_length = tf.shape(input_ids)[0], tf.shape(input_ids)[1]
-        
-        # 입력 토큰 임베딩
-        inputs_embeds = self.embed_tokens(input_ids)
-        
-        # 위치 인코딩 추가
-        hidden_states = self.positional_embedding(inputs_embeds)
-        
-        # 드롭아웃
-        hidden_states = self.dropout(hidden_states, training=training)
-        
-        # 어텐션 마스크 확인 및 생성
-        if attention_mask is None:
-            # 인과적 마스크 생성 (자기 자신과 이전 위치만 볼 수 있음)
-            attention_mask = 1.0 - tf.linalg.band_part(
-                tf.ones((seq_length, seq_length)), -1, 0)
-            attention_mask = tf.expand_dims(attention_mask, 0)  # [1, seq_len, seq_len]
-        
-        # 초기화
-        all_hidden_states = ()
-        all_self_attentions = ()
-        all_cross_attentions = ()
-        present_key_values = () if use_cache else None
-        
-        # 레이어별 처리
-        for i, layer in enumerate(self.layers):
-            all_hidden_states = all_hidden_states + (hidden_states,)
-            
-            # 과거 키/값 가져오기
-            past_key_value = past_key_values[i] if past_key_values is not None else None
-            
-            # 마스크 가져오기
-            layer_head_mask_i = layer_head_mask[i] if layer_head_mask is not None else None
-            cross_attn_layer_head_mask_i = cross_attn_layer_head_mask[i] if cross_attn_layer_head_mask is not None else None
-            
-            # 레이어 호출
-            hidden_states, self_attn_weights, cross_attn_weights, present_key_value = layer(
-                hidden_states,
-                encoder_hidden_states=encoder_hidden_states,
-                attention_mask=attention_mask,
-                encoder_attention_mask=encoder_attention_mask,
-                layer_head_mask=layer_head_mask_i,
-                cross_attn_layer_head_mask=cross_attn_layer_head_mask_i,
-                past_key_value=past_key_value,
-                training=training
-            )
-            
-            # 결과 저장
-            all_self_attentions = all_self_attentions + (self_attn_weights,)
-            all_cross_attentions = all_cross_attentions + (cross_attn_weights,)
-            
-            if use_cache:
-                present_key_values = present_key_values + (present_key_value,)
-        
-        # 최종 레이어 정규화
+    def call(self, hidden_states, training=False):
+        hidden_states = self.dense(hidden_states)
         hidden_states = self.layer_norm(hidden_states)
-        
-        # 결과 반환
-        return {
-            "last_hidden_state": hidden_states,
-            "past_key_values": present_key_values,
-            "hidden_states": all_hidden_states,
-            "attentions": all_self_attentions,
-            "cross_attentions": all_cross_attentions
-        }
+        hidden_states = self.dropout(hidden_states, training=training)
+        return hidden_states
 
-
-# 전체 Whisper 모델
-class WhisperModel(tf.keras.Model):
+# Wav2Vec2Quantizer 클래스 구현 (수정됨)
+class Wav2Vec2Quantizer(tf.keras.layers.Layer):
     def __init__(self, config):
-        super(WhisperModel, self).__init__()
+        super(Wav2Vec2Quantizer, self).__init__()
         self.config = config
         
-        # 인코더와 디코더 초기화
-        self.encoder = WhisperEncoder(config)
-        self.decoder = WhisperDecoder(config)
+        # 코드북 벡터 초기화
+        self.codevectors = tf.Variable(
+            initial_value=tf.random.normal(
+                [config.num_codevector_groups, config.num_codevectors_per_group, config.codevector_dim // config.num_codevector_groups]
+            ),
+            trainable=True,
+            name="codevectors"
+        )
+        
+        # 입력 차원을 codevector_dim으로 투영하는 레이어
+        self.projection = tf.keras.layers.Dense(config.codevector_dim, name="project_to_codevector_dim")
     
-    def call(self, input_features, decoder_input_ids=None,
-             attention_mask=None, decoder_attention_mask=None,
-             encoder_outputs=None, past_key_values=None,
-             use_cache=None, return_dict=True, training=False):
-        """
-        input_features: 멜 스펙트로그램 특징 [batch_size, n_mels, seq_len]
-        decoder_input_ids: 디코더 입력 토큰 ID [batch_size, seq_len]
-        """
-        use_cache = use_cache if use_cache is not None else self.config.use_cache
+    def call(self, hidden_states, training=False):
+        original_shape = tf.shape(hidden_states)
+        batch_size, sequence_length = original_shape[0], original_shape[1]
         
-        # 인코더 처리 (인코더 출력이 제공되지 않은 경우)
-        if encoder_outputs is None and input_features is not None:
-            encoder_outputs = self.encoder(
-                input_features,
-                attention_mask=attention_mask,
-                training=training
-            )
+        # 입력을 codevector_dim으로 투영
+        hidden_states = self.projection(hidden_states)
         
-        # 인코더 출력
-        encoder_hidden_states = encoder_outputs["last_hidden_state"]
+        # 실제 배치 크기가 0인 경우 처리 (분산 학습에서 발생 가능)
+        if tf.equal(batch_size, 0):
+            # 빈 텐서 반환
+            quantized_features = tf.zeros([0, sequence_length, self.config.codevector_dim], dtype=tf.float32)
+            dummy_encodings = tf.zeros([self.config.num_codevector_groups, 0, sequence_length, self.config.num_codevectors_per_group], dtype=tf.float32)
+            dummy_distances = tf.zeros([self.config.num_codevector_groups, 0, sequence_length, self.config.num_codevectors_per_group], dtype=tf.float32)
+            
+            return {
+                "quantized_features": quantized_features,
+                "encodings": dummy_encodings,
+                "distances": dummy_distances,
+                "codevector_perplexity": tf.constant(1.0)
+            }
         
-        # 디코더 입력이 제공되지 않은 경우 시작 토큰 생성
-        if decoder_input_ids is None:
-            batch_size = tf.shape(encoder_hidden_states)[0]
-            decoder_input_ids = tf.fill((batch_size, 1), self.config.decoder_start_token_id)
+        # hidden_states를 그룹 수에 맞게 재구성
+        group_dim = self.config.codevector_dim // self.config.num_codevector_groups
+        hidden_states = tf.reshape(
+            hidden_states, 
+            [batch_size, sequence_length, self.config.num_codevector_groups, group_dim]
+        )
         
-        # 디코더 호출
-        decoder_outputs = self.decoder(
-            decoder_input_ids,
-            encoder_hidden_states=encoder_hidden_states,
-            attention_mask=decoder_attention_mask,
-            encoder_attention_mask=attention_mask,
-            past_key_values=past_key_values,
-            use_cache=use_cache,
+        # 각 그룹별로 코드벡터와의 거리 계산
+        distances = []
+        quantized_features = []
+        encodings = []
+        
+        for i in range(self.config.num_codevector_groups):
+            group_hidden = hidden_states[:, :, i, :]  # [batch, time, group_dim]
+            
+            # 현재 그룹의 코드벡터들 [num_vectors, group_dim]
+            group_vectors = self.codevectors[i]
+            
+            # 거리 계산을 위해 텐서를 확장
+            # group_hidden: [batch, time, 1, group_dim]
+            # group_vectors: [1, 1, num_vectors, group_dim]
+            expanded_hidden = tf.expand_dims(group_hidden, axis=2)
+            expanded_vectors = tf.expand_dims(tf.expand_dims(group_vectors, axis=0), axis=0)
+            
+            # 유클리드 거리 계산: [batch, time, num_vectors]
+            dist = tf.reduce_sum(tf.square(expanded_hidden - expanded_vectors), axis=-1)
+            distances.append(dist)
+            
+            # 가장 가까운 코드벡터 인덱스: [batch, time]
+            indices = tf.argmin(dist, axis=-1)
+            
+            # one-hot 인코딩: [batch, time, num_vectors]
+            encoding = tf.one_hot(indices, self.config.num_codevectors_per_group, dtype=tf.float32)
+            encodings.append(encoding)
+            
+            # 양자화된 특징: [batch, time, group_dim]
+            quantized = tf.matmul(encoding, group_vectors)
+            quantized_features.append(quantized)
+        
+        # 결과 결합
+        # distances: [num_groups, batch, time, num_vectors]
+        distances = tf.stack(distances, axis=0)
+        
+        # encodings: [num_groups, batch, time, num_vectors]  
+        encodings = tf.stack(encodings, axis=0)
+        
+        # quantized_features: [batch, time, codevector_dim]
+        quantized_features = tf.concat(quantized_features, axis=-1)
+        
+        # 다양성 계산 (코드북 활용도)
+        # 시간 차원에서 평균을 계산할 때 실제 길이 고려
+        avg_probs = tf.reduce_mean(encodings, axis=[1, 2])  # [num_groups, num_vectors]
+        
+        # 수치적 안정성을 위한 작은 값 추가
+        avg_probs = tf.clip_by_value(avg_probs, 1e-10, 1.0)
+        
+        # 퍼플렉시티 계산
+        perplexity = tf.exp(-tf.reduce_sum(avg_probs * tf.math.log(avg_probs + 1e-10), axis=-1))
+        perplexity = tf.reduce_mean(perplexity)
+        
+        return {
+            "quantized_features": quantized_features,
+            "encodings": encodings,
+            "distances": distances,
+            "codevector_perplexity": perplexity
+        }
+
+# ============ 주요 모델 클래스 ============ #
+
+# 메인 wav2vec2 모델 구현
+class Wav2Vec2Model(tf.keras.Model):
+    def __init__(self, config):
+        super(Wav2Vec2Model, self).__init__()
+        self.config = config
+        
+        # 특징 추출기 및 투영
+        self.feature_extractor = Wav2Vec2FeatureExtractor(config)
+        self.feature_projection = tf.keras.layers.Dense(config.hidden_size, name="feature_projection")
+        self.feature_projection_layer_norm = tf.keras.layers.LayerNormalization(epsilon=config.layer_norm_eps)
+        self.feature_projection_dropout = tf.keras.layers.Dropout(config.hidden_dropout)
+        
+        # 인코더
+        self.encoder = Wav2Vec2Encoder(config)
+        
+        # 양자화기 (pre-training에서 사용)
+        # 실제 구현은 생략되었지만 실제 사용 시 구현 필요
+        self.quantizer = Wav2Vec2Quantizer(config)
+
+        # 투영 헤드
+        self.project_hid = Wav2Vec2ProjectionHead(config)
+        self.project_q = Wav2Vec2ProjectionHead(config)
+    
+    def call(self, inputs, attention_mask=None, 
+             output_attentions=False, output_hidden_states=False,
+             return_dict=True, training=False):
+        
+        # 1. 특징 추출
+        extract_features = self.feature_extractor(inputs, training=training)
+        
+        # 2. 특징 투영 - hidden_size 차원으로 투영
+        # 특징 추출기의 출력 차원(conv_dim[-1])과 인코더의 입력 차원(hidden_size)을 맞추기 위한 투영
+        hidden_states = self.feature_projection(extract_features)
+        hidden_states = self.feature_projection_layer_norm(hidden_states)
+        hidden_states = self.feature_projection_dropout(hidden_states, training=training)
+        
+        # 3. 타겟 양자화를 위한 특징 제공
+        if training:
+            # 양자화 대상 특징 - 투영된 특징을 사용
+            quantize_targets = hidden_states
+            
+            # 양자화
+            quantized_result = self.quantizer(quantize_targets, training=True)
+            quantized_features = quantized_result["quantized_features"]
+            codevector_perplexity = quantized_result["codevector_perplexity"]
+        else:
+            quantized_features = None
+            codevector_perplexity = None
+        
+        # 4. 인코더에 전달
+        encoder_outputs = self.encoder(
+            hidden_states,
+            attention_mask=attention_mask,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
             training=training
         )
         
         if not return_dict:
-            return (
-                decoder_outputs["last_hidden_state"],
-                decoder_outputs["past_key_values"],
-                encoder_outputs["last_hidden_state"]
-            )
+            return encoder_outputs
         
-        return {
-            "last_hidden_state": decoder_outputs["last_hidden_state"],
-            "past_key_values": decoder_outputs["past_key_values"],
-            "encoder_last_hidden_state": encoder_outputs["last_hidden_state"],
-            "encoder_hidden_states": encoder_outputs.get("hidden_states", None),
-            "encoder_attentions": encoder_outputs.get("attentions", None),
-            "decoder_hidden_states": decoder_outputs.get("hidden_states", None),
-            "decoder_attentions": decoder_outputs.get("attentions", None),
-            "cross_attentions": decoder_outputs.get("cross_attentions", None)
+        # 반환값 준비
+        result = {
+            "last_hidden_state": encoder_outputs["last_hidden_state"],
+            "extract_features": extract_features
         }
+        
+        if quantized_features is not None:
+            result["quantized_features"] = quantized_features
+        
+        if codevector_perplexity is not None:
+            result["codevector_perplexity"] = codevector_perplexity
+        
+        if output_hidden_states:
+            result["hidden_states"] = encoder_outputs["hidden_states"]
+        
+        if output_attentions:
+            result["attentions"] = encoder_outputs["attentions"]
+        
+        return result
 
-
-# 언어 모델링을 위한 Whisper 모델
-class WhisperForConditionalGeneration(tf.keras.Model):
+# 사전학습 wav2vec2 모델 구현 (수정됨)
+class Wav2Vec2ForPreTraining(tf.keras.Model):
     def __init__(self, config):
-        super(WhisperForConditionalGeneration, self).__init__()
+        super(Wav2Vec2ForPreTraining, self).__init__()
         self.config = config
         
-        # 기본 Whisper 모델
-        self.model = WhisperModel(config)
+        # 기본 wav2vec2 모델
+        self.wav2vec2 = Wav2Vec2Model(config)
         
-        # 언어 모델링 헤드
-        self.lm_head = tf.keras.layers.Dense(config.vocab_size, use_bias=False)
+        # 손실 계산 및 학습에 필요한 매개변수
+        self.num_negatives = config.num_negatives
+        self.contrastive_logits_temperature = config.contrastive_logits_temperature
+        self.diversity_loss_weight = config.diversity_loss_weight
     
-    def call(self, input_features, decoder_input_ids=None,
-             attention_mask=None, decoder_attention_mask=None,
-             encoder_outputs=None, past_key_values=None,
-             labels=None, use_cache=None, return_dict=True, training=False):
-        """
-        input_features: 멜 스펙트로그램 특징 [batch_size, n_mels, seq_len]
-        decoder_input_ids: 디코더 입력 토큰 ID [batch_size, seq_len]
-        labels: 타겟 토큰 ID [batch_size, seq_len]
-        """
-        # 디코더 입력이 제공되지 않은 경우 레이블에서 생성
-        if decoder_input_ids is None and labels is not None:
-            # 레이블의 오른쪽으로 시프트하여 디코더 입력 생성 (teacher forcing)
-            decoder_input_ids = tf.pad(
-                labels[:, :-1], 
-                [[0, 0], [1, 0]], 
-                constant_values=self.config.decoder_start_token_id
-            )
-        
-        # Whisper 모델 호출
-        outputs = self.model(
-            input_features=input_features,
-            decoder_input_ids=decoder_input_ids,
-            encoder_outputs=encoder_outputs,
+    def call(self, inputs, attention_mask=None, output_attentions=False, output_hidden_states=False, training=False):
+        # wav2vec2 모델 호출
+        outputs = self.wav2vec2(
+            inputs,
             attention_mask=attention_mask,
-            decoder_attention_mask=decoder_attention_mask,
-            past_key_values=past_key_values,
-            use_cache=use_cache,
-            return_dict=True,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
             training=training
         )
         
-        # 언어 모델링 헤드 적용
-        lm_logits = self.lm_head(outputs["last_hidden_state"])
+        # 컨트라스트 학습을 위한 변환
+        if training and "quantized_features" in outputs:
+            # 인코더 출력 프로젝션
+            transformer_features = self.wav2vec2.project_hid(outputs["last_hidden_state"])
+            
+            # 양자화된 특징 프로젝션
+            quantized_features = self.wav2vec2.project_q(outputs["quantized_features"])
+            
+            # 손실 계산을 위한 정보 추가
+            outputs["projected_quantized_features"] = quantized_features
+            outputs["projected_states"] = transformer_features
+        
+        return outputs
+    
+    def train_step(self, data):
+        inputs, _ = data
+        
+        with tf.GradientTape() as tape:
+            # 모델 순전파
+            outputs = self(inputs, training=True)
+            
+            # 대조 손실 계산
+            logits, loss = self._compute_contrastive_loss(
+                outputs["projected_states"],
+                outputs["projected_quantized_features"]
+            )
+            
+            # 다양성 손실 추가
+            diversity_loss = self._compute_diversity_loss(outputs["codevector_perplexity"])
+            
+            # 최종 손실
+            total_loss = loss + self.diversity_loss_weight * diversity_loss
+        
+        # 그래디언트 계산 및 적용
+        gradients = tape.gradient(total_loss, self.trainable_variables)
+        self.optimizer.apply_gradients(zip(gradients, self.trainable_variables))
+        
+        # 손실 기록
+        self.compiled_metrics.update_state(0, total_loss)
+        
+        results = {m.name: m.result() for m in self.metrics}
+        results.update({
+            "contrastive_loss": loss,
+            "diversity_loss": diversity_loss,
+            "perplexity": outputs["codevector_perplexity"]
+        })
+        
+        return results
+    
+    @tf.function
+    def _compute_contrastive_loss(self, hidden_states, quantized_states):
+        """개선된 컨트라스트 손실 계산"""
+        batch_size = tf.shape(hidden_states)[0]
+        sequence_length = tf.shape(hidden_states)[1]
+        
+        # 빈 배치 처리
+        if tf.equal(batch_size, 0):
+            return tf.zeros([0, 0, 1], dtype=tf.float32), tf.constant(0.0)
+        
+        # 양수 쌍 계산
+        pos_logits = tf.reduce_sum(hidden_states * quantized_states, axis=-1) / self.contrastive_logits_temperature
+        
+        # 음수 쌍 생성 (개선된 방법)
+        if self.num_negatives > 0:
+            # 더 안전한 negative sampling
+            neg_indices = self._sample_negative_indices(sequence_length, batch_size)
+            
+            # 안전한 gather 연산
+            neg_quantized = tf.gather(quantized_states, neg_indices, axis=1, batch_dims=1)
+            
+            # 차원 확장 및 로짓 계산
+            hidden_states_expanded = tf.expand_dims(hidden_states, axis=2)
+            neg_logits = tf.reduce_sum(hidden_states_expanded * neg_quantized, axis=-1) / self.contrastive_logits_temperature
+            
+            # 로짓 결합
+            logits = tf.concat([tf.expand_dims(pos_logits, axis=2), neg_logits], axis=2)
+        else:
+            logits = tf.expand_dims(pos_logits, axis=2)
+        
+        # 손실 계산
+        labels = tf.zeros([batch_size, sequence_length], dtype=tf.int32)
+        loss = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=labels, logits=logits)
+        
+        return logits, tf.reduce_mean(loss)
+    
+    def _compute_diversity_loss(self, perplexity):
+        """다양성 손실 계산 - 코드북 활용도를 높이기 위함"""
+        # 퍼플렉시티가 높을수록 다양성이 높음을 의미
+        # 인위적으로 다양성을 높이기 위해 -perplexity를 최소화
+        return -perplexity
+    
+    @tf.function  
+    def _sample_negative_indices(self, sequence_length, batch_size):
+        """안전한 negative sampling"""
+        # sequence_length가 num_negatives보다 작은 경우 처리
+        actual_negatives = tf.minimum(self.num_negatives, sequence_length - 1)
+        
+        # 인덱스 범위 생성
+        indices_range = tf.range(sequence_length)
+        
+        # 각 배치에 대해 셔플된 인덱스 생성
+        neg_indices_list = []
+        
+        for _ in range(batch_size):
+            shuffled = tf.random.shuffle(indices_range)
+            # 필요한 만큼만 선택
+            selected = shuffled[:actual_negatives]
+            # 부족한 경우 반복하여 채움
+            if actual_negatives < self.num_negatives:
+                repeats = tf.math.ceil(self.num_negatives / actual_negatives)
+                repeated = tf.tile(selected, [tf.cast(repeats, tf.int32)])
+                selected = repeated[:self.num_negatives]
+            
+            neg_indices_list.append(selected)
+        
+        # [batch_size, num_negatives] 형태로 스택
+        neg_indices = tf.stack(neg_indices_list, axis=0)
+        
+        # [batch_size, sequence_length, num_negatives] 형태로 확장
+        # 각 시간 스텝에 대해 동일한 negative 인덱스 사용
+        neg_indices = tf.tile(tf.expand_dims(neg_indices, axis=1), [1, sequence_length, 1])
+        
+        return neg_indices
+
+
+# wav2vec2 음성 인식(ASR) 모델 구현
+class Wav2Vec2ForCTC(tf.keras.Model):
+    def __init__(self, config):
+        super(Wav2Vec2ForCTC, self).__init__()
+        self.config = config
+        
+        # 기본 wav2vec2 모델
+        self.wav2vec2 = Wav2Vec2Model(config)
+        
+        # CTC를 위한 투영 레이어
+        self.dropout = tf.keras.layers.Dropout(config.hidden_dropout)
+        self.lm_head = tf.keras.layers.Dense(config.vocab_size, name="lm_head")
+        
+        # CTC 손실 설정
+        self.ctc_loss_reduction = config.ctc_loss_reduction
+        self.ctc_zero_infinity = config.ctc_zero_infinity
+    
+    def call(self, inputs, attention_mask=None, labels=None, 
+             output_attentions=False, output_hidden_states=False,
+             return_dict=True, training=False):
+        
+        # wav2vec2 모델 호출
+        outputs = self.wav2vec2(
+            inputs,
+            attention_mask=attention_mask,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            training=training
+        )
+        
+        # 최종 히든 스테이트
+        hidden_states = outputs["last_hidden_state"]
+        hidden_states = self.dropout(hidden_states, training=training)
+        
+        # 로짓 계산
+        logits = self.lm_head(hidden_states)
         
         # 손실 계산 (학습 중이고 레이블이 제공된 경우)
         loss = None
         if training and labels is not None:
-            # 손실 계산을 위해 레이블 시프트 (teacher forcing)
-            shift_labels = labels[:, 1:]
-            shift_logits = lm_logits[:, :-1, :]
-            
-            # 손실 계산 (교차 엔트로피)
-            loss_fn = tf.keras.losses.SparseCategoricalCrossentropy(
-                from_logits=True, reduction=tf.keras.losses.Reduction.NONE
-            )
-            
-            loss = loss_fn(shift_labels, shift_logits)
-            
-            # 패딩 토큰 마스킹 (패딩 토큰은 손실 계산에서 제외)
-            if decoder_attention_mask is not None:
-                loss = loss * tf.cast(decoder_attention_mask[:, :-1], dtype=loss.dtype)
-                loss = tf.reduce_sum(loss) / tf.reduce_sum(tf.cast(decoder_attention_mask[:, :-1], dtype=loss.dtype))
-            else:
-                loss = tf.reduce_mean(loss)
+            # CTC 손실 계산
+            loss = self._compute_ctc_loss(logits, labels, attention_mask)
         
         if not return_dict:
-            output = (lm_logits,) + outputs[1:]
+            output = (logits,) + outputs[1:]
             return ((loss,) + output) if loss is not None else output
         
         return {
             "loss": loss,
-            "logits": lm_logits,
-            "past_key_values": outputs["past_key_values"],
-            "encoder_last_hidden_state": outputs["encoder_last_hidden_state"],
-            "encoder_hidden_states": outputs.get("encoder_hidden_states", None),
-            "encoder_attentions": outputs.get("encoder_attentions", None),
-            "decoder_hidden_states": outputs.get("decoder_hidden_states", None),
-            "decoder_attentions": outputs.get("decoder_attentions", None),
-            "cross_attentions": outputs.get("cross_attentions", None)
+            "logits": logits,
+            "hidden_states": outputs.get("hidden_states", None),
+            "attentions": outputs.get("attentions", None)
         }
     
-    def prepare_inputs_for_generation(self, decoder_input_ids, past_key_values=None, 
-                                     attention_mask=None, use_cache=None, encoder_outputs=None,
-                                     **kwargs):
-        """
-        생성(디코딩) 중에 입력을 준비하는 도우미 함수
-        """
-        # 과거 키/값이 제공되면 마지막 토큰만 입력으로 사용
-        if past_key_values is not None:
-            decoder_input_ids = decoder_input_ids[:, -1:]
+    def _compute_ctc_loss(self, logits, labels, attention_mask=None):
+        """CTC 손실 계산"""
+        # 로짓 길이 (time steps) 계산
+        input_lengths = tf.ones(tf.shape(logits)[0], dtype=tf.int32) * tf.shape(logits)[1]
         
-        return {
-            "decoder_input_ids": decoder_input_ids,
-            "past_key_values": past_key_values,
-            "encoder_outputs": encoder_outputs,
-            "attention_mask": attention_mask,
-            "use_cache": use_cache
-        }
-    
-    def generate(self, input_features, max_length=None, min_length=None, 
-                 num_beams=None, temperature=1.0, top_k=None, top_p=None,
-                 repetition_penalty=None, attention_mask=None, **kwargs):
-        """
-        텍스트 생성 함수
-        """
-        max_length = max_length if max_length is not None else self.config.max_target_positions
-        min_length = min_length if min_length is not None else 0
-        num_beams = num_beams if num_beams is not None else 1
-        temperature = temperature if temperature is not None else 1.0
-        top_k = top_k if top_k is not None else 50
-        top_p = top_p if top_p is not None else 1.0
-        repetition_penalty = repetition_penalty if repetition_penalty is not None else 1.0
+        # 마스크가 있는 경우 길이 조정
+        if attention_mask is not None:
+            input_lengths = tf.reduce_sum(attention_mask, axis=1, keepdims=False)
+            
+        # 레이블 길이 계산
+        label_lengths = tf.reduce_sum(tf.cast(labels > 0, tf.int32), axis=1, keepdims=False)
         
-        batch_size = tf.shape(input_features)[0]
-        
-        # 인코더 출력 계산
-        encoder_outputs = self.model.encoder(
-            input_features=input_features,
-            attention_mask=attention_mask,
-            training=False
+        # CTC 손실 계산
+        loss = tf.nn.ctc_loss(
+            labels=tf.cast(labels, tf.int32),
+            logits=tf.transpose(logits, perm=[1, 0, 2]),  # CTC는 time-major 형식 필요
+            label_length=label_lengths,
+            logit_length=input_lengths,
+            blank_index=0,
+            logits_time_major=True
         )
         
-        # 디코더 시작 토큰 설정
-        decoder_input_ids = tf.fill((batch_size, 1), self.config.decoder_start_token_id)
+        # 무한 손실 처리
+        if self.ctc_zero_infinity:
+            loss = tf.where(tf.math.is_inf(loss), tf.zeros_like(loss), loss)
         
-        # 생성 루프 (간단한 그리디 디코딩 구현)
-        for _ in range(max_length):
-            # 모델 호출
-            outputs = self.model(
-                input_features=None,  # 인코더는 이미 실행됨
-                decoder_input_ids=decoder_input_ids,
-                encoder_outputs=encoder_outputs,
-                attention_mask=attention_mask,
-                use_cache=True,
-                training=False
-            )
-            
-            # 다음 토큰 예측
-            next_token_logits = outputs["logits"][:, -1, :]
-            
-            # 온도 적용
-            if temperature != 1.0:
-                next_token_logits = next_token_logits / temperature
-            
-            # Top-k 샘플링
-            if top_k > 0:
-                indices_to_remove = tf.argsort(next_token_logits, direction='DESCENDING')[:, top_k:]
-                indices_to_remove = tf.expand_dims(indices_to_remove, -1)
-                next_token_logits = tf.tensor_scatter_nd_update(
-                    next_token_logits,
-                    indices_to_remove,
-                    tf.fill([tf.shape(indices_to_remove)[0], tf.shape(indices_to_remove)[1]], -float('inf'))
-                )
-            
-            # 다음 토큰 선택
-            if num_beams > 1:
-                # 빔 서치 구현은 복잡하므로 여기서는 생략
-                pass
-            else:
-                # 그리디 디코딩
-                next_tokens = tf.argmax(next_token_logits, axis=-1, output_type=tf.int32)
-            
-            # EOS 토큰 체크
-            eos_tokens = tf.equal(next_tokens, self.config.eos_token_id)
-            
-            # 새 토큰 추가
-            decoder_input_ids = tf.concat([decoder_input_ids, tf.expand_dims(next_tokens, -1)], axis=-1)
-            
-            # 모든 시퀀스가 EOS 토큰에 도달했는지 확인
-            if tf.reduce_all(eos_tokens):
-                break
+        # 손실 축소 방법
+        if self.ctc_loss_reduction == "mean":
+            loss = tf.reduce_mean(loss)
+        elif self.ctc_loss_reduction == "sum":
+            loss = tf.reduce_sum(loss)
         
-        return decoder_input_ids
+        return loss
     
     def train_step(self, data):
-        """
-        학습 스텝 구현
-        """
-        features, labels = data
+        inputs, labels = data
         
         with tf.GradientTape() as tape:
             # 모델 순전파
-            outputs = self(features, labels=labels, training=True)
+            outputs = self(inputs, labels=labels, training=True)
             loss = outputs["loss"]
         
         # 그래디언트 계산 및 적용
         gradients = tape.gradient(loss, self.trainable_variables)
         self.optimizer.apply_gradients(zip(gradients, self.trainable_variables))
         
-        # 메트릭 업데이트
+        # 손실 기록
+        self.compiled_metrics.update_state(0, loss)
+        
+        # 결과 반환
+        results = {m.name: m.result() for m in self.metrics}
+        results.update({"loss": loss})
+        
+        return results
+
+
+# 음성 분류 모델 구현 (예: 감정 분류)
+class Wav2Vec2ForSequenceClassification(tf.keras.Model):
+    def __init__(self, config):
+        super(Wav2Vec2ForSequenceClassification, self).__init__()
+        self.config = config
+        
+        # 기본 wav2vec2 모델
+        self.wav2vec2 = Wav2Vec2Model(config)
+        
+        # 분류를 위한 추가 레이어
+        self.projector = tf.keras.layers.Dense(config.classifier_proj_size, activation="tanh", name="classifier_proj")
+        self.dropout = tf.keras.layers.Dropout(config.hidden_dropout)
+        self.classifier = tf.keras.layers.Dense(config.num_labels, name="classifier")
+    
+    def call(self, inputs, attention_mask=None, labels=None,
+             output_attentions=False, output_hidden_states=False,
+             return_dict=True, training=False):
+        
+        # wav2vec2 모델 호출
+        outputs = self.wav2vec2(
+            inputs,
+            attention_mask=attention_mask,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            training=training
+        )
+        
+        # 최종 히든 스테이트에서 시퀀스 임베딩 추출 (평균 풀링)
+        hidden_states = outputs["last_hidden_state"]
+        
+        # 마스크 적용 (있는 경우)
+        if attention_mask is not None:
+            # 마스크 확장하여 히든 스테이트와 동일한 차원으로 만들기
+            float_mask = tf.cast(tf.expand_dims(attention_mask, -1), tf.float32)
+            # 마스크된 평균 계산 (마스크가 0인 부분은 제외)
+            pooled_output = tf.reduce_sum(hidden_states * float_mask, axis=1) / tf.reduce_sum(float_mask, axis=1)
+        else:
+            # 마스크가 없는 경우 단순 평균 계산
+            pooled_output = tf.reduce_mean(hidden_states, axis=1)
+        
+        # 분류 레이어 적용
+        pooled_output = self.projector(pooled_output)
+        pooled_output = self.dropout(pooled_output, training=training)
+        logits = self.classifier(pooled_output)
+        
+        # 손실 계산 (학습 중이고 레이블이 제공된 경우)
+        loss = None
+        if training and labels is not None:
+            # 분류 손실 계산 (예: 교차 엔트로피)
+            loss = tf.keras.losses.sparse_categorical_crossentropy(
+                y_true=labels, y_pred=logits, from_logits=True
+            )
+            loss = tf.reduce_mean(loss)
+        
+        if not return_dict:
+            output = (logits,) + outputs[1:]
+            return ((loss,) + output) if loss is not None else output
+        
+        return {
+            "loss": loss,
+            "logits": logits,
+            "hidden_states": outputs.get("hidden_states", None),
+            "attentions": outputs.get("attentions", None)
+        }
+    
+    def train_step(self, data):
+        inputs, labels = data
+        
+        with tf.GradientTape() as tape:
+            # 모델 순전파
+            outputs = self(inputs, labels=labels, training=True)
+            loss = outputs["loss"]
+        
+        # 그래디언트 계산 및 적용
+        gradients = tape.gradient(loss, self.trainable_variables)
+        self.optimizer.apply_gradients(zip(gradients, self.trainable_variables))
+        
+        # 손실 기록
         self.compiled_metrics.update_state(labels, outputs["logits"])
         
         # 결과 반환
@@ -735,176 +1030,219 @@ class WhisperForConditionalGeneration(tf.keras.Model):
 
 # ============ 유틸리티 함수 및 학습 관련 코드 ============ #
 
-# 오디오 특징 추출 함수
-def extract_fbank_features(waveform, sample_rate=16000, n_mels=80, n_fft=400, hop_length=160):
+# 시간 마스킹 적용 함수
+def apply_time_mask(hidden_states, mask_prob=0.05, mask_length=10):
+    """오디오 시퀀스의 시간 차원에 마스킹 적용"""
+    batch_size, sequence_length, hidden_size = tf.shape(hidden_states)[0], tf.shape(hidden_states)[1], tf.shape(hidden_states)[2]
+    
+    # 마스크 생성
+    mask = tf.random.uniform(shape=(batch_size, sequence_length)) < mask_prob
+    
+    # 연속적인 마스킹 확장 (mask_length만큼 연속으로 마스킹)
+    expanded_mask = tf.zeros_like(mask, dtype=tf.bool)
+    
+    for i in range(mask_length):
+        # 마스크를 i 위치만큼 이동하여 원래 마스크와 OR 연산
+        shifted_mask = tf.pad(mask[:, :sequence_length-i], [[0, 0], [i, 0]], constant_values=False)
+        expanded_mask = tf.logical_or(expanded_mask, shifted_mask)
+    
+    # 확장된 마스크를 히든 스테이트와 동일한 차원으로 만들기
+    expanded_mask = tf.cast(tf.expand_dims(expanded_mask, -1), tf.float32)
+    
+    # 마스킹된 위치는 0으로 설정
+    masked_hidden_states = hidden_states * (1.0 - expanded_mask)
+    
+    return masked_hidden_states, expanded_mask
+
+
+# 특징 마스킹 적용 함수
+def apply_feature_mask(hidden_states, mask_prob=0.05, mask_length=10):
+    """오디오 특징 차원에 마스킹 적용"""
+    batch_size, sequence_length, hidden_size = tf.shape(hidden_states)[0], tf.shape(hidden_states)[1], tf.shape(hidden_states)[2]
+    
+    # 차원별 마스크 생성
+    mask = tf.random.uniform(shape=(batch_size, hidden_size)) < mask_prob
+    
+    # 연속적인 마스킹 확장 (mask_length만큼 연속으로 마스킹)
+    expanded_mask = tf.zeros_like(mask, dtype=tf.bool)
+    
+    for i in range(mask_length):
+        # 마스크를 i 위치만큼 이동하여 원래 마스크와 OR 연산
+        shifted_mask = tf.pad(mask[:, :hidden_size-i], [[0, 0], [i, 0]], constant_values=False)
+        expanded_mask = tf.logical_or(expanded_mask, shifted_mask)
+    
+    # 확장된 마스크를 히든 스테이트와 동일한 차원으로 만들기
+    expanded_mask = tf.cast(tf.expand_dims(expanded_mask, 1), tf.float32)
+    
+    # 마스킹된 위치는 0으로 설정
+    masked_hidden_states = hidden_states * (1.0 - expanded_mask)
+    
+    return masked_hidden_states, expanded_mask
+
+
+# 더미 오디오 데이터셋 생성 (수정됨)
+def create_dummy_dataset(batch_size):
     """
-    오디오 파형에서 멜 스펙트로그램 특징 추출
+    형태가 일관된 더미 오디오 데이터셋 생성
     """
-    # TensorFlow로 FFT 계산
-    stfts = tf.signal.stft(
-        waveform, 
-        frame_length=n_fft, 
-        frame_step=hop_length, 
-        fft_length=n_fft
+    def generate_consistent_data():
+        # 고정된 길이의 오디오 데이터 생성
+        audio_length = 80000  # 5초 * 16kHz
+        
+        # 더미 오디오 특징 생성
+        audio_features = tf.random.normal([audio_length], dtype=tf.float32)
+        
+        # 더미 레이블
+        label = tf.constant(0.0, dtype=tf.float32)
+        
+        return audio_features, label
+    
+    # 데이터셋 생성
+    dataset = tf.data.Dataset.from_generator(
+        lambda: [generate_consistent_data() for _ in range(50)],
+        output_signature=(
+            tf.TensorSpec(shape=[80000], dtype=tf.float32),
+            tf.TensorSpec(shape=[], dtype=tf.float32)
+        )
     )
     
-    # 스펙트럼의 파워 계산
-    power_spectrograms = tf.math.square(tf.abs(stfts))
+    # 배치 처리 - drop_remainder=True로 일관된 배치 크기 보장
+    dataset = dataset.batch(batch_size, drop_remainder=True)
+    dataset = dataset.repeat()
+    dataset = dataset.prefetch(tf.data.AUTOTUNE)
     
-    # 멜 필터뱅크 생성
-    num_spectrogram_bins = n_fft // 2 + 1
-    linear_to_mel_weight_matrix = tf.signal.linear_to_mel_weight_matrix(
-        n_mels, num_spectrogram_bins, sample_rate, 0, sample_rate // 2
-    )
-    
-    # 멜 스펙트로그램 계산
-    mel_spectrograms = tf.tensordot(power_spectrograms, linear_to_mel_weight_matrix, 1)
-    
-    # 로그 멜 스펙트로그램 계산
-    log_mel_spectrograms = tf.math.log(mel_spectrograms + 1e-6)
-    
-    return log_mel_spectrograms
+    return dataset
 
 
-# 텍스트 전처리 함수
-def preprocess_text(text, tokenizer):
-    """
-    텍스트를 토큰화하고 모델 입력 형식으로 변환
-    """
-    # 텍스트 정규화 및 토큰화
-    tokens = tokenizer.encode(text)
+# 전체 모델과 데이터셋을 연결하여 분산 학습 실행
+def create_full_model(model_type="pretraining", 
+                      num_negatives=100,
+                      mask_time_prob=0.065,
+                      mask_time_length=10):
+    """전체 wav2vec2 모델 생성"""
     
-    # 시작 및 종료 토큰 추가
-    tokens = [tokenizer.bos_token_id] + tokens + [tokenizer.eos_token_id]
+    # 모델 설정
+    config = Wav2Vec2Config()
     
-    return tokens
+    # 필요한 모델 유형에 맞게 설정 수정
+    config.num_negatives = num_negatives
+    config.mask_time_prob = mask_time_prob
+    config.mask_time_length = mask_time_length
+    
+    if model_type == "pretraining":
+        return Wav2Vec2ForPreTraining(config)
+    elif model_type == "asr":
+        # 음성인식 (ASR)을 위한 모델 반환
+        return Wav2Vec2ForCTC(config)
+    elif model_type == "classification":
+        # 분류를 위한 모델 반환
+        return Wav2Vec2ForSequenceClassification(config)
+    else:
+        # 기본 모델 반환
+        return Wav2Vec2Model(config)
 
 
-# 더미 데이터셋 생성
-def create_dummy_dataset(batch_size, n_mels=80, seq_len=3000, max_target_length=100):
-    """
-    학습용 더미 오디오-텍스트 데이터셋을 생성합니다.
-    """
-    # 충분히 큰 더미 데이터셋
-    num_samples = 50  # 데이터셋 크기
-    
-    # 더미 특성 (멜 스펙트로그램) 생성
-    dummy_features = np.random.randn(num_samples, n_mels, seq_len).astype(np.float32)
-    
-    # 더미 레이블 (토큰 ID) 생성 - 첫 번째 토큰은 BOS(1), 마지막 토큰은 EOS(2)로 설정
-    dummy_labels = np.zeros((num_samples, max_target_length), dtype=np.int32)
-    
-    # 각 시퀀스의 실제 길이 (50~90 사이의 무작위 길이)
-    sequence_lengths = np.random.randint(50, 90, size=num_samples)
-    
-    for i in range(num_samples):
-        # 첫 번째 토큰은 BOS 토큰
-        dummy_labels[i, 0] = 1  # BOS token
-        
-        # 중간 토큰은 랜덤 (3부터 100 사이의 값)
-        length = sequence_lengths[i]
-        dummy_labels[i, 1:length-1] = np.random.randint(3, 100, size=length-2)
-        
-        # 마지막 토큰은 EOS 토큰
-        dummy_labels[i, length-1] = 2  # EOS token
-    
-    # TensorFlow 데이터셋 생성
-    dataset = tf.data.Dataset.from_tensor_slices((dummy_features, dummy_labels))
-    
-    # 배치 설정 및 반복
-    return dataset.batch(batch_size).repeat()
-
-
-# 분산 학습 스텝 정의
+# 분산 학습 스텝 정의 (수정됨)
 @tf.function
 def distributed_train_step(strategy, model, dist_inputs, optimizer):
-    """분산 학습을 위한 스텝 함수"""
+    """개선된 분산 학습 스텝"""
     
     def train_step(inputs):
         features, labels = inputs
         
+        # 배치 크기 검증
+        batch_size = tf.shape(features)[0]
+        
+        # 빈 배치인 경우 0 손실 반환
+        if tf.equal(batch_size, 0):
+            return tf.constant(0.0, dtype=tf.float32)
+        
         with tf.GradientTape() as tape:
-            # 모델 호출
-            try:
+            # 모델 순전파
+            outputs = model(features, training=True)
+            
+            # 손실 계산
+            if isinstance(model, Wav2Vec2ForPreTraining):
+                if "projected_states" in outputs and "projected_quantized_features" in outputs:
+                    # 컨트라스트 손실 계산
+                    logits, contrastive_loss = model._compute_contrastive_loss(
+                        outputs["projected_states"],
+                        outputs["projected_quantized_features"]
+                    )
+                    
+                    # 다양성 손실 추가
+                    if "codevector_perplexity" in outputs:
+                        diversity_loss = model._compute_diversity_loss(outputs["codevector_perplexity"])
+                    else:
+                        diversity_loss = tf.constant(0.0)
+                    
+                    # 최종 손실
+                    loss = contrastive_loss + model.diversity_loss_weight * diversity_loss
+                else:
+                    loss = tf.constant(0.0)
+            else:
                 outputs = model(features, labels=labels, training=True)
-                loss = outputs["loss"]
-                
-                # 그래디언트 계산 및 적용
-                gradients = tape.gradient(loss, model.trainable_variables)
-                optimizer.apply_gradients(zip(gradients, model.trainable_variables))
-                
-                return loss
-            except Exception as e:
-                print(f"학습 스텝 실행 중 오류 발생: {e}")
-                # 형태 디버깅 출력
-                print(f"features.shape: {features.shape}")
-                print(f"labels.shape: {labels.shape}")
-                raise
+                loss = outputs.get("loss", 0.0)
+            
+            # NaN 체크
+            loss = tf.where(tf.math.is_nan(loss), tf.constant(0.0), loss)
+            
+            # 분산 환경에서 손실 정규화
+            scaled_loss = loss / tf.cast(strategy.num_replicas_in_sync, tf.float32)
+        
+        # 그래디언트 계산
+        gradients = tape.gradient(scaled_loss, model.trainable_variables)
+        
+        # None 그래디언트 필터링
+        gradients = [
+            tf.zeros_like(var) if grad is None else grad 
+            for grad, var in zip(gradients, model.trainable_variables)
+        ]
+        
+        # 그래디언트 클리핑
+        gradients, _ = tf.clip_by_global_norm(gradients, 1.0)
+        
+        # 옵티마이저 적용
+        optimizer.apply_gradients(zip(gradients, model.trainable_variables))
+        
+        return scaled_loss
     
-    # 분산 전략으로 학습 스텝 실행
+    # 분산 전략으로 실행
     per_replica_losses = strategy.run(train_step, args=(dist_inputs,))
     
-    # 손실 값 집계
+    # 손실 집계
     return strategy.reduce(tf.distribute.ReduceOp.SUM, per_replica_losses, axis=None)
 
-
-# Whisper 모델 생성 함수
-def create_whisper_model(model_type="small"):
-    """
-    지정된 크기의 Whisper 모델 생성
-    """
-    config = WhisperConfig()
+# wav2vec2 모델 메인 학습 함수 (수정됨)
+def train_wav2vec2(strategy, model_type="pretraining", num_epochs=1, learning_rate=3e-5):
+    """수정된 wav2vec2 모델 학습 함수"""
     
-    # 모델 크기에 따른 설정 조정
-    if model_type == "tiny":
-        config.d_model = 384
-        config.encoder_layers = 4
-        config.encoder_attention_heads = 6
-        config.decoder_layers = 4
-        config.decoder_attention_heads = 6
-        config.d_ff = 1536
-    elif model_type == "base":
-        config.d_model = 512
-        config.encoder_layers = 6
-        config.encoder_attention_heads = 8
-        config.decoder_layers = 6
-        config.decoder_attention_heads = 8
-        config.d_ff = 2048
-    elif model_type == "medium":
-        config.d_model = 1024
-        config.encoder_layers = 24
-        config.encoder_attention_heads = 16
-        config.decoder_layers = 24
-        config.decoder_attention_heads = 16
-        config.d_ff = 4096
-    elif model_type == "large":
-        config.d_model = 1280
-        config.encoder_layers = 32
-        config.encoder_attention_heads = 20
-        config.decoder_layers = 32
-        config.decoder_attention_heads = 20
-        config.d_ff = 5120
-    
-    # Whisper-small은 기본값 사용 (config 생성 시 이미 설정됨)
-    
-    return WhisperForConditionalGeneration(config)
-
-
-# Whisper 학습 함수
-def train_whisper(strategy, model_type="small", num_epochs=1, learning_rate=1e-4):
-    """Whisper 모델 학습 함수"""
     with strategy.scope():
         # 모델 생성
-        model = create_whisper_model(model_type=model_type)
+        model = create_full_model(model_type=model_type)
         
         # 옵티마이저 설정
-        optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
+        optimizer = tf.keras.optimizers.Adam(
+            learning_rate=learning_rate,
+            epsilon=1e-8,
+            clipnorm=1.0
+        )
         
         # 메트릭 설정
-        metrics = [
-            tf.keras.metrics.SparseCategoricalAccuracy(name="accuracy"),
-            tf.keras.metrics.Mean(name="loss")
-        ]
+        metrics = []
+        if model_type == "pretraining":
+            metrics.extend([
+                tf.keras.metrics.Mean(name="contrastive_loss"),
+                tf.keras.metrics.Mean(name="diversity_loss"),
+                tf.keras.metrics.Mean(name="perplexity")
+            ])
+        elif model_type == "asr":
+            metrics.append(tf.keras.metrics.Mean(name="ctc_loss"))
+        elif model_type == "classification":
+            metrics.extend([
+                tf.keras.metrics.SparseCategoricalAccuracy(name="accuracy"),
+                tf.keras.metrics.Mean(name="loss")
+            ])
         
         # 모델 컴파일
         model.compile(optimizer=optimizer, metrics=metrics)
@@ -929,66 +1267,64 @@ def train_whisper(strategy, model_type="small", num_epochs=1, learning_rate=1e-4
         print(f"Epoch {epoch+1}/{num_epochs}")
         
         for _ in range(MAX_ITERATIONS):
-            # 분산 데이터셋에서 배치 가져오기
             try:
+                # 분산 데이터셋에서 배치 가져오기
                 inputs = next(iterator)
+                
+                # 현재 시간 기록
+                step_start = time.time()
+                
+                # 분산 학습 스텝 실행 (strategy 명시적 전달)
+                loss = distributed_train_step(strategy, model, inputs, optimizer)
+                
+                # 스텝 완료 시간
+                step_end = time.time()
+                step_duration = step_end - step_start
+                elapsed = step_end - start_time
+                
+                # 모든 스텝에 대해 타임스탬프와 함께 로깅
+                print(f"Step {step}, Loss: {loss.numpy():.4f}, Time: {time.strftime('%H:%M:%S')} (경과: {elapsed:.2f}초, 스텝 시간: {step_duration:.2f}초)")
+                
+                step += 1
+                
+                # 주기적 체크포인트 저장
+                if step % 50 == 0:
+                    checkpoint.save(os.path.join(checkpoint_dir, f"model_step_{step}"))
+                
             except StopIteration:
                 iterator = iter(dist_dataset)
                 inputs = next(iterator)
-            
-            # 현재 시간 기록
-            step_start = time.time()
-            
-            # 분산 학습 스텝 실행
-            loss = distributed_train_step(strategy, model, inputs, optimizer)
-            
-            # 스텝 완료 시간
-            step_end = time.time()
-            step_duration = step_end - step_start
-            elapsed = step_end - start_time
-            
-            # 로깅
-            print(f"Step {step}, Loss: {loss.numpy():.4f}, Time: {time.strftime('%H:%M:%S')} (경과: {elapsed:.2f}초, 스텝 시간: {step_duration:.2f}초)")
-            
-            step += 1
+                
+                # 현재 시간 기록
+                step_start = time.time()
+                
+                # 분산 학습 스텝 실행
+                loss = distributed_train_step(strategy, model, inputs, optimizer)
+                
+                # 스텝 완료 시간
+                step_end = time.time()
+                step_duration = step_end - step_start
+                elapsed = step_end - start_time
+                
+                print(f"Step {step}, Loss: {loss.numpy():.4f}, Time: {time.strftime('%H:%M:%S')} (경과: {elapsed:.2f}초, 스텝 시간: {step_duration:.2f}초)")
+                
+                step += 1
+                
+            except Exception as e:
+                print(f"Error at step {step}: {e}")
+                # 에러 발생 시 데이터셋 재시작
+                iterator = iter(dist_dataset)
+                continue
         
         # 에포크 종료 후 체크포인트 저장
-        checkpoint.save(os.path.join(checkpoint_dir, f"whisper_{model_type}_epoch_{epoch+1}"))
+        checkpoint.save(os.path.join(checkpoint_dir, f"model_epoch_{epoch+1}"))
     
     return model
 
 
-# 추론 함수
-def transcribe_audio(model, audio_path, tokenizer=None, max_length=448):
-    """
-    오디오 파일에서 텍스트 추출
-    """
-    # 오디오 로드 및 전처리
-    # 실제 구현에서는 여기에 오디오 로드 코드가 필요함
-    # 여기서는 더미 데이터 사용
-    dummy_waveform = np.random.randn(16000 * 30).astype(np.float32)  # 30초 오디오
-    
-    # 특징 추출
-    features = extract_fbank_features(dummy_waveform)
-    features = tf.expand_dims(features, 0)  # 배치 차원 추가
-    
-    # 추론
-    decoder_input_ids = tf.fill((1, 1), model.config.decoder_start_token_id)
-    outputs = model.generate(features, max_length=max_length)
-    
-    # 토큰 ID에서 텍스트 변환
-    if tokenizer is not None:
-        transcription = tokenizer.decode(outputs[0].numpy())
-    else:
-        # 토크나이저가 없는 경우 ID만 반환
-        transcription = outputs[0].numpy()
-    
-    return transcription
-
-
 # 메인 함수
 def main(strategy):
-    print("Whisper-small 분산 학습 시작...")
+    print("Wav2Vec2 분산 학습 시작...")
     
     # 네트워크 및 GPU 모니터링 시작
     os.system('sh /workspace/network.sh &')  # network profile
@@ -1000,9 +1336,10 @@ network profile started!
     
     # JCT 측정 시작
     start_time = time.time()
+    start_time_tf = tf.timestamp()
     
     # 모델 학습 실행
-    model = train_whisper(strategy, model_type="small")
+    model = train_wav2vec2(strategy, model_type="pretraining")
     
     # JCT 측정 종료
     end_time = time.time()
@@ -1013,22 +1350,25 @@ network profile started!
     print("jct:", jct)
     
     # JCT 파일 저장
-    model_txt = open('/workspace/model.txt', 'r')
-    save_dir_name = model_txt.read()
-    jct_file = open('/result/' + save_dir_name.strip() + '/' + task_type + '_' + str(task_index) + '_jct.txt', 'w')
-    jct_file.write('%.2f' % (float(jct)))
-    jct_file.close()
-    model_txt.close()
+    try:
+        model_txt = open('/workspace/model.txt', 'r')
+        save_dir_name = model_txt.read()
+        jct_file = open('/result/' + save_dir_name.strip() + '/' + task_type + '_' + str(task_index) + '_jct.txt', 'w')
+        jct_file.write('%.2f' % (float(jct)))
+        jct_file.close()
+        model_txt.close()
+    except Exception as e:
+        print(f"JCT 파일 저장 중 오류: {e}")
     
     # 모델 저장
-    model_path = os.path.join(CACHE_DIR, "whisper_small_model")
+    model_path = os.path.join(CACHE_DIR, "wav2vec2_model")
     model.save_weights(model_path)
     print(f"모델이 {model_path}에 저장되었습니다.")
 
 
 if __name__ == "__main__":
     # 명령줄 인자 파싱
-    parser = argparse.ArgumentParser(description='Whisper-small Distributed Speech Recognition')
+    parser = argparse.ArgumentParser(description='wav2vec2 Distributed Speech Recognition')
     parser.add_argument('--num_batches', type=int, default=40, help='num_batches per replica, default is set 40')
     parser.add_argument('--batch_size', type=int, default=1, help='batch size per replica, default is set 1')
     args = parser.parse_args()
@@ -1039,12 +1379,24 @@ if __name__ == "__main__":
     task_type = task_config.get('type')
     task_index = task_config.get('index')
 
-    # 모델과 데이터셋을 저장할 로컬 디렉토리 설정
+    # 모델과 프로세서를 저장할 로컬 디렉토리 설정
     CACHE_DIR = '/workspace/model_cache'  # 컨테이너 내 사전 준비된 모델 캐시 경로
     DATASET_DIR = '/workspace/datasets'  # 컨테이너 내 사전 준비된 데이터셋 경로
 
-    # 분산 학습 전략 설정
-    strategy = tf.distribute.MultiWorkerMirroredStrategy()
+    # 분산 학습 전략 설정 - 안정성 개선
+    os.environ['GRPC_VERBOSITY'] = 'ERROR'
+    os.environ['TF_GRPC_DEFAULT_OPTIONS'] = 'grpc.keepalive_time_ms=30000,grpc.keepalive_timeout_ms=5000,grpc.keepalive_permit_without_calls=true,grpc.http2.max_pings_without_data=0,grpc.http2.min_time_between_pings_ms=10000,grpc.http2.min_ping_interval_without_data_ms=300000'
+    os.environ['TF_COLLECTIVE_OP_TIMEOUT'] = '120'
+    
+    # 통신 옵션으로 안정성 향상
+    communication_options = tf.distribute.experimental.CommunicationOptions(
+        implementation=tf.distribute.experimental.CommunicationImplementation.NCCL,
+        timeout_seconds=120.0
+    )
+    
+    strategy = tf.distribute.MultiWorkerMirroredStrategy(
+        communication_options=communication_options
+    )
 
     # 하이퍼파라미터 설정
     BATCH_SIZE_PER_REPLICA = args.batch_size
