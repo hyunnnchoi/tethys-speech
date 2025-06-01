@@ -1183,6 +1183,22 @@ def train_wav2vec2(model_type="pretraining", model_size="small", num_epochs=1, l
     # 모델 생성
     model = create_full_model(model_type=model_type, model_size=model_size)
     
+    # 데이터셋 생성 (단일 GPU용) - 모델 초기화를 위해 먼저 생성
+    train_dataset = create_dummy_dataset(batch_size)
+    iterator = iter(train_dataset)
+    
+    # 모델 초기화를 위해 첫 번째 배치로 한 번 호출
+    try:
+        first_batch = next(iterator)
+        print("모델 가중치 초기화 중...")
+        # 모델 호출로 가중치 생성
+        _ = model(first_batch[0], training=False)
+        print("모델 가중치 초기화 완료")
+    except Exception as e:
+        print(f"모델 초기화 중 오류 발생: {e}")
+        # 다시 iterator 생성
+        iterator = iter(train_dataset)
+    
     # 옵티마이저 설정
     optimizer = tf.keras.optimizers.Adam(
         learning_rate=learning_rate,
@@ -1209,9 +1225,6 @@ def train_wav2vec2(model_type="pretraining", model_size="small", num_epochs=1, l
     # 모델 컴파일
     model.compile(optimizer=optimizer, metrics=metrics)
     
-    # 데이터셋 생성 (단일 GPU용)
-    train_dataset = create_dummy_dataset(batch_size)
-    
     # 체크포인트 설정
     checkpoint_dir = './checkpoints'
     os.makedirs(checkpoint_dir, exist_ok=True)
@@ -1219,7 +1232,6 @@ def train_wav2vec2(model_type="pretraining", model_size="small", num_epochs=1, l
     
     # 학습 루프
     step = 0
-    iterator = iter(train_dataset)
     
     # 시작 시간 기록
     start_time = time.time()
