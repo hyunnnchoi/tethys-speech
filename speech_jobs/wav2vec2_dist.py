@@ -1,3 +1,17 @@
+# Tiny 모델 (~15-20M 파라미터):
+# hidden_size: 256
+# num_hidden_layers: 4
+# num_attention_heads: 4
+# intermediate_size: 1024
+# conv_dim: [128, 128, 128, 128] (4 layers)
+
+# Small 모델 (~30-40M 파라미터):
+# hidden_size: 512
+# num_hidden_layers: 6
+# num_attention_heads: 8
+# intermediate_size: 2048
+# conv_dim: [256, 256, 256, 256, 256] (5 layers)
+
 import tensorflow as tf
 import numpy as np
 import json
@@ -8,35 +22,74 @@ import argparse
 
 
 class Wav2Vec2Config:
-    def __init__(self):
+    def __init__(self, model_size="small"):
+        # 모델 크기에 따른 설정
+        if model_size == "small":
+            # Small 모델 설정 (약 30-40M 파라미터)
+            self.hidden_size = 512
+            self.num_hidden_layers = 6
+            self.num_attention_heads = 8
+            self.intermediate_size = 2048
+            self.conv_dim = [256, 256, 256, 256, 256]  # 5 layers, 채널 수 줄임
+            self.conv_stride = [5, 2, 2, 2, 2]
+            self.conv_kernel = [10, 3, 3, 3, 2]
+            self.num_conv_pos_embeddings = 64  # 128 → 64
+            self.num_conv_pos_embedding_groups = 8  # 16 → 8
+            
+        elif model_size == "tiny":
+            # Tiny 모델 설정 (약 15-20M 파라미터)
+            self.hidden_size = 256
+            self.num_hidden_layers = 4
+            self.num_attention_heads = 4
+            self.intermediate_size = 1024
+            self.conv_dim = [128, 128, 128, 128]  # 4 layers
+            self.conv_stride = [5, 2, 2, 2]
+            self.conv_kernel = [10, 3, 3, 2]
+            self.num_conv_pos_embeddings = 32
+            self.num_conv_pos_embedding_groups = 4
+            
+        else:  # base 모델 (기존 설정)
+            self.hidden_size = 768
+            self.num_hidden_layers = 12
+            self.num_attention_heads = 12
+            self.intermediate_size = 3072
+            self.conv_dim = [512, 512, 512, 512, 512, 512, 512]
+            self.conv_stride = [5, 2, 2, 2, 2, 2, 2]
+            self.conv_kernel = [10, 3, 3, 3, 3, 2, 2]
+            self.num_conv_pos_embeddings = 128
+            self.num_conv_pos_embedding_groups = 16
+
         # 특징 추출기 설정
         self.feat_extract_norm = "group"
         self.feat_extract_activation = "gelu"
-        self.conv_dim = [512, 512, 512, 512, 512, 512, 512]
-        self.conv_stride = [5, 2, 2, 2, 2, 2, 2]
-        self.conv_kernel = [10, 3, 3, 3, 3, 2, 2]
         self.conv_bias = False
-        self.num_conv_pos_embeddings = 128
-        self.num_conv_pos_embedding_groups = 16
         
-        # 모델 차원 및 인코더 설정
-        self.hidden_size = 768
-        self.num_hidden_layers = 12
-        self.num_attention_heads = 12
-        self.intermediate_size = 3072
+        # 공통 설정들
         self.hidden_act = "gelu"
         self.hidden_dropout = 0.1
         self.activation_dropout = 0.1
         self.attention_dropout = 0.1
         self.layer_norm_eps = 1e-5
         
-        # 양자화 및 마스킹 설정
-        self.num_codevectors_per_group = 320
-        self.num_codevector_groups = 2
+        # 양자화 및 마스킹 설정 (small 모델에 맞게 조정)
+        if model_size == "small":
+            self.num_codevectors_per_group = 160  # 320 → 160
+            self.num_codevector_groups = 2
+            self.codevector_dim = 128  # 256 → 128
+            self.proj_codevector_dim = 128  # 256 → 128
+        elif model_size == "tiny":
+            self.num_codevectors_per_group = 80
+            self.num_codevector_groups = 2
+            self.codevector_dim = 64
+            self.proj_codevector_dim = 64
+        else:  # base
+            self.num_codevectors_per_group = 320
+            self.num_codevector_groups = 2
+            self.codevector_dim = 256
+            self.proj_codevector_dim = 256
+            
         self.contrastive_logits_temperature = 0.1
         self.num_negatives = 100
-        self.codevector_dim = 256
-        self.proj_codevector_dim = 256
         self.diversity_loss_weight = 0.1
         self.ctc_loss_reduction = "sum"
         self.ctc_zero_infinity = False
@@ -51,11 +104,28 @@ class Wav2Vec2Config:
         self.vocab_size = 32
         self.do_stable_layer_norm = True
         self.use_weighted_layer_sum = False
-        self.classifier_proj_size = 256
-        self.tdnn_dim = [512, 512, 512, 512, 1500]
+        
+        # 분류 관련 설정 (small 모델에 맞게 조정)
+        if model_size == "small":
+            self.classifier_proj_size = 128  # 256 → 128
+        elif model_size == "tiny":
+            self.classifier_proj_size = 64
+        else:
+            self.classifier_proj_size = 256
+            
+        # TDNN 설정도 작게 조정
+        if model_size == "small":
+            self.tdnn_dim = [256, 256, 256, 256, 768]
+            self.xvector_output_dim = 256
+        elif model_size == "tiny":
+            self.tdnn_dim = [128, 128, 128, 128, 384]
+            self.xvector_output_dim = 128
+        else:
+            self.tdnn_dim = [512, 512, 512, 512, 1500]
+            self.xvector_output_dim = 512
+            
         self.tdnn_kernel = [5, 3, 3, 1, 1]
         self.tdnn_dilation = [1, 2, 3, 1, 1]
-        self.xvector_output_dim = 512
 
 
 # Gelu 활성화 함수 정의
@@ -978,11 +1048,11 @@ def apply_feature_mask(hidden_states, mask_prob=0.05, mask_length=10):
 # 더미 오디오 데이터셋 생성 (수정됨)
 def create_dummy_dataset(batch_size):
     """
-    형태가 일관된 더미 오디오 데이터셋 생성
+    형태가 일관된 더미 오디오 데이터셋 생성 - 메모리 절약을 위해 길이 단축
     """
     def generate_consistent_data():
-        # 고정된 길이의 오디오 데이터 생성
-        audio_length = 80000  # 5초 * 16kHz
+        # 메모리 절약을 위해 더 짧은 오디오 데이터 생성 (2초)
+        audio_length = 32000  # 2초 * 16kHz (기존 5초에서 단축)
         
         # 더미 오디오 특징 생성
         audio_features = tf.random.normal([audio_length], dtype=tf.float32)
@@ -996,7 +1066,7 @@ def create_dummy_dataset(batch_size):
     dataset = tf.data.Dataset.from_generator(
         lambda: [generate_consistent_data() for _ in range(50)],
         output_signature=(
-            tf.TensorSpec(shape=[80000], dtype=tf.float32),
+            tf.TensorSpec(shape=[32000], dtype=tf.float32),  # 길이 변경
             tf.TensorSpec(shape=[], dtype=tf.float32)
         )
     )
@@ -1011,13 +1081,14 @@ def create_dummy_dataset(batch_size):
 
 # 전체 모델과 데이터셋을 연결하여 분산 학습 실행
 def create_full_model(model_type="pretraining", 
+                      model_size="small",  # 추가: 모델 크기 선택
                       num_negatives=100,
                       mask_time_prob=0.065,
                       mask_time_length=10):
     """전체 wav2vec2 모델 생성"""
     
     # 모델 설정
-    config = Wav2Vec2Config()
+    config = Wav2Vec2Config(model_size=model_size)
     
     # 필요한 모델 유형에 맞게 설정 수정
     config.num_negatives = num_negatives
@@ -1115,12 +1186,12 @@ def distributed_train_step(strategy, model, dist_inputs, optimizer):
     return strategy.reduce(tf.distribute.ReduceOp.SUM, per_replica_losses, axis=None)
 
 # wav2vec2 모델 메인 학습 함수 (수정됨)
-def train_wav2vec2(strategy, model_type="pretraining", num_epochs=1, learning_rate=3e-5):
+def train_wav2vec2(strategy, model_type="pretraining", model_size="small", num_epochs=1, learning_rate=3e-5):
     """수정된 wav2vec2 모델 학습 함수"""
     
     with strategy.scope():
         # 모델 생성
-        model = create_full_model(model_type=model_type)
+        model = create_full_model(model_type=model_type, model_size=model_size)
         
         # 옵티마이저 설정
         optimizer = tf.keras.optimizers.Adam(
@@ -1232,8 +1303,28 @@ def train_wav2vec2(strategy, model_type="pretraining", num_epochs=1, learning_ra
 
 
 # 메인 함수
-def main(strategy):
+def main(strategy, model_size):
     print("Wav2Vec2 분산 학습 시작...")
+    print(f"선택된 모델 크기: {model_size}")
+    
+    # 모델 크기별 파라미터 수 안내
+    if model_size == "tiny":
+        print("Tiny 모델: 약 15-20M 파라미터")
+    elif model_size == "small":
+        print("Small 모델: 약 30-40M 파라미터")
+    else:
+        print("Base 모델: 약 95M 파라미터")
+    
+    print("16GB V100 GPU에 최적화된 설정")
+    
+    # 메모리 최적화 설정
+    gpus = tf.config.experimental.list_physical_devices('GPU')
+    if gpus:
+        try:
+            for gpu in gpus:
+                tf.config.experimental.set_memory_growth(gpu, True)
+        except RuntimeError as e:
+            print(f"GPU 메모리 설정 오류: {e}")
     
     # 네트워크 및 GPU 모니터링 시작
     os.system('sh /workspace/network.sh &')  # network profile
@@ -1248,7 +1339,7 @@ network profile started!
     start_time_tf = tf.timestamp()
     
     # 모델 학습 실행
-    model = train_wav2vec2(strategy, model_type="pretraining")
+    model = train_wav2vec2(strategy, model_type="pretraining", model_size=model_size)
     
     # JCT 측정 종료
     end_time = time.time()
@@ -1270,9 +1361,9 @@ network profile started!
         print(f"JCT 파일 저장 중 오류: {e}")
     
     # 모델 저장
-    model_path = os.path.join(CACHE_DIR, "wav2vec2_model")
+    model_path = os.path.join(CACHE_DIR, f"wav2vec2_{model_size}_model")
     model.save_weights(model_path)
-    print(f"모델이 {model_path}에 저장되었습니다.")
+    print(f"{model_size.capitalize()} 모델이 {model_path}에 저장되었습니다.")
 
 
 if __name__ == "__main__":
@@ -1280,6 +1371,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='wav2vec2 Distributed Speech Recognition')
     parser.add_argument('--num_batches', type=int, default=5, help='num_batches per replica, default is set 5')
     parser.add_argument('--batch_size', type=int, default=1, help='batch size per replica, default is set 1')
+    parser.add_argument('--model_size', type=str, default='small', choices=['tiny', 'small', 'base'], 
+                       help='Model size: tiny (~15-20M params), small (~30-40M params), base (~95M params)')
     args = parser.parse_args()
 
     # 환경 설정
@@ -1313,7 +1406,8 @@ if __name__ == "__main__":
     MAX_ITERATIONS = args.num_batches
     BUFFER_SIZE = 10000
 
+    print(f'선택된 모델 크기: {args.model_size}')
     print(f'batch size per replica: {BATCH_SIZE_PER_REPLICA}, global batch size: {GLOBAL_BATCH_SIZE}')
     print(f'num_batches: {MAX_ITERATIONS}')
     
-    main(strategy)
+    main(strategy, args.model_size)
