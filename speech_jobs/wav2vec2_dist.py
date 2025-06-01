@@ -1216,66 +1216,79 @@ def distributed_train_step_tf_func(strategy, model, dist_inputs, optimizer):
     """개선된 분산 학습 스텝 (tf.function으로 컴파일)"""
     
     def train_step(inputs):
-        features, labels = inputs # labels는 현재 더미 데이터에서 사용 안 함
+        features, labels = inputs 
         batch_size = tf.shape(features)[0]
+        # tf.print("train_step_fn: features shape:", tf.shape(features), "batch_size:", batch_size, output_stream=sys.stderr)
 
         def empty_batch_fn():
+            # tf.print("train_step_fn: empty_batch_fn called", output_stream=sys.stderr)
             return tf.constant(0.0, dtype=tf.float32)
         
         def normal_batch_fn():
+            # tf.print("train_step_fn: normal_batch_fn called", output_stream=sys.stderr)
             with tf.GradientTape() as tape:
                 outputs = model(features, training=True)
-                loss = tf.constant(0.0, dtype=tf.float32) # 기본 손실값 초기화
+                # tf.print("train_step_fn: model outputs:", outputs, summarize=-1, output_stream=sys.stderr)
+                
+                loss = tf.constant(0.0, dtype=tf.float32)
                 if isinstance(model, Wav2Vec2ForPreTraining):
+                    # tf.print("train_step_fn: Model is Wav2Vec2ForPreTraining", output_stream=sys.stderr)
                     if "projected_states" in outputs and "projected_quantized_features" in outputs:
+                        # tf.print("train_step_fn: Calculating pre-training loss", output_stream=sys.stderr)
                         _, contrastive_loss = model._compute_contrastive_loss(
                             outputs["projected_states"],
                             outputs["projected_quantized_features"]
                         )
                         diversity_loss = model._compute_diversity_loss(outputs.get("codevector_perplexity", tf.constant(0.0)))
                         loss = contrastive_loss + model.diversity_loss_weight * diversity_loss
-                    # else: loss는 이미 0.0으로 초기화됨
+                        # tf.print("train_step_fn: contrastive_loss:", contrastive_loss, "diversity_loss:", diversity_loss, "final loss:", loss, output_stream=sys.stderr)
+                    # else: tf.print("train_step_fn: Pre-training outputs not found, loss is 0.0", output_stream=sys.stderr)
                 else:
-                    # Wav2Vec2Model의 경우, 또는 다른 CTC/SequenceClassification 모델의 경우
-                    # 모델 자체에서 loss를 계산하거나, 여기서 추가적인 손실 계산 로직 필요
-                    # 예시: outputs가 딕셔너리이고 "loss" 키를 포함한다고 가정
-                    # 현재 Wav2Vec2Model은 loss를 직접 반환하지 않으므로, pre-training 모델이 아니면 이 부분 수정 필요
-                    # For ASR (CTC) or SequenceClassification, model call might need labels and return loss.
-                    # outputs = model(features, labels=labels, training=True) # if model accepts labels
-                    calculated_loss = outputs.get("loss") # 모델이 loss를 반환한다면
+                    # tf.print("train_step_fn: Model is NOT Wav2Vec2ForPreTraining", output_stream=sys.stderr)
+                    calculated_loss = outputs.get("loss")
                     if calculated_loss is not None:
                         loss = calculated_loss
-                    # else: loss는 이미 0.0으로 초기화됨 (또는 에러 처리)
+                        # tf.print("train_step_fn: Loss from model output:", loss, output_stream=sys.stderr)
+                    # else: tf.print("train_step_fn: Loss not in model output, loss is 0.0", output_stream=sys.stderr)
                 
                 loss = tf.where(tf.math.is_nan(loss), tf.constant(0.0, dtype=tf.float32), loss)
                 scaled_loss = loss / tf.cast(strategy.num_replicas_in_sync, tf.float32)
-            
+                # tf.print("train_step_fn: scaled_loss:", scaled_loss, output_stream=sys.stderr)
+
             gradients = tape.gradient(scaled_loss, model.trainable_variables)
-            # Filter out None gradients (if any, though less common with default initializers)
+            # tf.print("train_step_fn: Calculated gradients (first few may be None/zero if parts of model not used):", gradients, summarize=10, output_stream=sys.stderr)
+            
             trainable_vars = model.trainable_variables
             filtered_gradients = []
-            for i, grad in enumerate(gradients):
+            for i in range(tf.shape(trainable_vars)[0]): # Use tf.shape for loop range in tf.function
+                grad = gradients[i]
+                var = trainable_vars[i]
                 if grad is None:
-                    filtered_gradients.append(tf.zeros_like(trainable_vars[i]))
+                    # tf.print("train_step_fn: Gradient for var", var.name, "is None, replacing with zeros.", output_stream=sys.stderr)
+                    filtered_gradients.append(tf.zeros_like(var))
                 else:
                     filtered_gradients.append(grad)
             
-            # Apply gradients if they are not all zero (or handle appropriately)
-            # This check might be overly cautious if losses are always non-zero and models are complex enough.
-            # gradients, _ = tf.clip_by_global_norm(filtered_gradients, 1.0)
-            # optimizer.apply_gradients(zip(gradients, trainable_vars))
+            # tf.print("train_step_fn: Filtered gradients:", filtered_gradients, summarize=10, output_stream=sys.stderr)
+            clipped_gradients, global_norm = tf.clip_by_global_norm(filtered_gradients, 1.0)
+            # tf.print("train_step_fn: Clipped gradients (global norm:", global_norm, "):", clipped_gradients, summarize=10, output_stream=sys.stderr)
             
-            # Consider if optimizer should be applied if all gradients are zero (e.g. from empty batch or all None grads)
-            # For now, assume optimizer.apply_gradients handles it or clipping is sufficient.
-            clipped_gradients, _ = tf.clip_by_global_norm(filtered_gradients, 1.0)
             optimizer.apply_gradients(zip(clipped_gradients, trainable_vars))
-
+            # tf.print("train_step_fn: Gradients applied.", output_stream=sys.stderr)
             return scaled_loss
         
-        return tf.cond(tf.equal(batch_size, 0), empty_batch_fn, normal_batch_fn)
+        # tf.print("train_step_fn: Calling tf.cond for batch_size", output_stream=sys.stderr)
+        final_loss_in_train_step = tf.cond(tf.equal(batch_size, 0), empty_batch_fn, normal_batch_fn)
+        # tf.print("train_step_fn: Loss from cond:", final_loss_in_train_step, output_stream=sys.stderr)
+        return final_loss_in_train_step
     
+    # tf.print("distributed_train_step_tf_func: Calling strategy.run", output_stream=sys.stderr)
     per_replica_losses = strategy.run(train_step, args=(dist_inputs,))
-    return strategy.reduce(tf.distribute.ReduceOp.SUM, per_replica_losses, axis=None)
+    # tf.print("distributed_train_step_tf_func: per_replica_losses:", per_replica_losses, output_stream=sys.stderr)
+    
+    reduced_loss = strategy.reduce(tf.distribute.ReduceOp.SUM, per_replica_losses, axis=None)
+    # tf.print("distributed_train_step_tf_func: reduced_loss (WILL BE RETURNED):", reduced_loss, output_stream=sys.stderr)
+    return reduced_loss
 
 # wav2vec2 모델 메인 학습 함수 (수정됨)
 def train_wav2vec2(strategy, task_type, model_type="pretraining", model_size="small", num_epochs=1, learning_rate=3e-5):
