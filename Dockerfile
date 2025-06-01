@@ -9,7 +9,7 @@ RUN apt-get update && \
 
 # TensorFlow 2와 호환되는 이전 버전의 transformers 설치
 RUN pip install --upgrade pip && \
-    pip install "transformers==4.18.0" datasets && \
+    pip install "transformers==4.18.0" datasets psutil && \
     pip install tensorflow-datasets && \
     pip install librosa soundfile
 

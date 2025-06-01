@@ -19,6 +19,7 @@ import os
 import sys
 import time
 import argparse
+import psutil # psutil 추가
 
 
 class Wav2Vec2Config:
@@ -1153,6 +1154,42 @@ def create_dummy_dataset(batch_size):
     return dataset
 
 
+# 시스템 리소스 로깅 함수 (psutil 사용)
+def log_system_resources():
+    p = psutil.Process(os.getpid())
+    print(f"---- System Resource Log (PID: {p.pid}) ----")
+    try:
+        # 파일 디스크립터
+        # psutil로는 시스템 전체 파일 디스크립터 정보를 직접 가져오기 어려움. /proc/sys/fs/file-nr 유지.
+        # 단, /proc 접근 권한이 없을 수 있으므로 try-except로 감쌈.
+        try:
+            with open('/proc/sys/fs/file-nr', 'r') as f:
+                fd_info = f.read().strip()
+                print(f"  [FD] System-wide: {fd_info}")
+        except Exception as e:
+            print(f"  [FD] System-wide: Error reading /proc/sys/fs/file-nr - {e}")
+        print(f"  [FD] Process ({p.pid}) num_fds: {p.num_fds()}")
+    except psutil.Error as e:
+        print(f"  [FD] Error getting FD info: {e}")
+
+    try:
+        # 스레드 수
+        print(f"  [Threads] Process ({p.pid}) num_threads: {p.num_threads()}")
+    except psutil.Error as e:
+        print(f"  [Threads] Error getting thread info: {e}")
+
+    try:
+        # 메모리 (RAM)
+        vm = psutil.virtual_memory()
+        print(f"  [Memory] System RAM: Total: {vm.total / (1024**2):.2f}MB, Available: {vm.available / (1024**2):.2f}MB, Used: {vm.used / (1024**2):.2f}MB, Percent: {vm.percent}%")
+        # 프로세스 메모리 (RSS, VSZ)
+        proc_mem = p.memory_info()
+        print(f"  [Memory] Process ({p.pid}) RSS: {proc_mem.rss / (1024**2):.2f}MB, VSZ: {proc_mem.vms / (1024**2):.2f}MB")
+    except psutil.Error as e:
+        print(f"  [Memory] Error getting memory info: {e}")
+    print("----------------------------------------")
+
+
 # 전체 모델과 데이터셋을 연결하여 분산 학습 실행
 def create_full_model(model_type="pretraining", 
                       model_size="small",  # 추가: 모델 크기 선택
@@ -1260,7 +1297,7 @@ def distributed_train_step(strategy, model, dist_inputs, optimizer):
     return strategy.reduce(tf.distribute.ReduceOp.SUM, per_replica_losses, axis=None)
 
 # wav2vec2 모델 메인 학습 함수 (수정됨)
-def train_wav2vec2(strategy, model_type="pretraining", model_size="small", num_epochs=1, learning_rate=3e-5):
+def train_wav2vec2(strategy, task_type, model_type="pretraining", model_size="small", num_epochs=1, learning_rate=3e-5):
     """수정된 wav2vec2 모델 학습 함수"""
     
     with strategy.scope():
@@ -1292,7 +1329,7 @@ def train_wav2vec2(strategy, model_type="pretraining", model_size="small", num_e
         
         # 모델 컴파일
         model.compile(optimizer=optimizer, metrics=metrics)
-    
+
     # 데이터셋 생성
     train_dataset = create_dummy_dataset(GLOBAL_BATCH_SIZE)
     
@@ -1316,138 +1353,123 @@ def train_wav2vec2(strategy, model_type="pretraining", model_size="small", num_e
     start_time = time.time()
     
     for epoch in range(num_epochs):
-        print(f"Epoch {epoch+1}/{num_epochs}")
+        if task_type == 'chief':
+             print(f"Epoch {epoch+1}/{num_epochs}")
         
         for _ in range(MAX_ITERATIONS):
             try:
-                # 분산 데이터셋에서 배치 가져오기
                 inputs = next(iterator)
-                
-                # 현재 시간 기록
                 step_start = time.time()
-                
-                # 분산 학습 스텝 실행 (strategy 명시적 전달)
                 loss = distributed_train_step(strategy, model, inputs, optimizer)
-                
-                # 스텝 완료 시간
                 step_end = time.time()
                 step_duration = step_end - step_start
                 elapsed = step_end - start_time
                 
-                # 모든 스텝에 대해 타임스탬프와 함께 로깅
-                try:
-                    loss_value = float(loss)
-                except:
-                    loss_value = 0.0
-                print(f"Step {step}, Loss: {loss_value:.4f}, Time: {time.strftime('%H:%M:%S')} (경과: {elapsed:.2f}초, 스텝 시간: {step_duration:.2f}초)")
+                if task_type == 'chief':
+                    try:
+                        loss_value = float(loss)
+                    except:
+                        loss_value = 0.0
+                    print(f"Step {step}, Loss: {loss_value:.4f}, Time: {time.strftime('%H:%M:%S')} (경과: {elapsed:.2f}초, 스텝 시간: {step_duration:.2f}초)")
+                    if step % 1 == 0: 
+                        log_system_resources()
                 
                 step += 1
                 
-                # 주기적 체크포인트 저장
-                if step % 50 == 0:
+                if task_type == 'chief' and step % 50 == 0:
                     checkpoint.save(os.path.join(checkpoint_dir, f"model_step_{step}"))
                 
             except StopIteration:
                 iterator = iter(dist_dataset)
                 inputs = next(iterator)
-                
-                # 현재 시간 기록
                 step_start = time.time()
-                
-                # 분산 학습 스텝 실행
                 loss = distributed_train_step(strategy, model, inputs, optimizer)
-                
-                # 스텝 완료 시간
                 step_end = time.time()
                 step_duration = step_end - step_start
                 elapsed = step_end - start_time
                 
-                try:
-                    loss_value = float(loss)
-                except:
-                    loss_value = 0.0
-                print(f"Step {step}, Loss: {loss_value:.4f}, Time: {time.strftime('%H:%M:%S')} (경과: {elapsed:.2f}초, 스텝 시간: {step_duration:.2f}초)")
+                if task_type == 'chief':
+                    try:
+                        loss_value = float(loss)
+                    except:
+                        loss_value = 0.0
+                    print(f"Step {step}, Loss: {loss_value:.4f}, Time: {time.strftime('%H:%M:%S')} (경과: {elapsed:.2f}초, 스텝 시간: {step_duration:.2f}초)")
+                    if step % 1 == 0: 
+                        log_system_resources()
                 
                 step += 1
                 
             except Exception as e:
-                print(f"Error at step {step}: {e}")
-                # 에러 발생 시 데이터셋 재시작
+                if task_type == 'chief':
+                    print(f"Error at step {step}: {e}")
+                    log_system_resources()
                 iterator = iter(dist_dataset)
                 continue
         
-        # 에포크 종료 후 체크포인트 저장
-        checkpoint.save(os.path.join(checkpoint_dir, f"model_epoch_{epoch+1}"))
+        if task_type == 'chief':
+            checkpoint.save(os.path.join(checkpoint_dir, f"model_epoch_{epoch+1}"))
     
     return model
 
 
 # 메인 함수
 def main(strategy, model_size):
-    print("Wav2Vec2 분산 학습 시작...")
-    print(f"선택된 모델 크기: {model_size}")
+    tf_config = json.loads(os.environ.get('TF_CONFIG') or '{}')
+    task_config = tf_config.get('task', {})
+    task_type = task_config.get('type', 'chief') 
+    task_index = task_config.get('index', 0)
+
+    if task_type == 'chief':
+        print("Wav2Vec2 분산 학습 시작...")
+        print(f"선택된 모델 크기: {model_size}")
+        if model_size == "tiny":
+            print("Tiny 모델: 약 15-20M 파라미터")
+        elif model_size == "small":
+            print("Small 모델: 약 30-40M 파라미터")
+        else:
+            print("Base 모델: 약 95M 파라미터")
+        print("16GB V100 GPU에 최적화된 설정")
     
-    # 모델 크기별 파라미터 수 안내
-    if model_size == "tiny":
-        print("Tiny 모델: 약 15-20M 파라미터")
-    elif model_size == "small":
-        print("Small 모델: 약 30-40M 파라미터")
-    else:
-        print("Base 모델: 약 95M 파라미터")
-    
-    print("16GB V100 GPU에 최적화된 설정")
-    
-    # 메모리 최적화 설정
     gpus = tf.config.experimental.list_physical_devices('GPU')
     if gpus:
         try:
             for gpu in gpus:
                 tf.config.experimental.set_memory_growth(gpu, True)
         except RuntimeError as e:
-            print(f"GPU 메모리 설정 오류: {e}")
+            if task_type == 'chief':
+                 print(f"GPU 메모리 설정 오류: {e}")
     
-    # 네트워크 및 GPU 모니터링 시작
-    os.system('sh /workspace/network.sh &')  # network profile
-    os.system('sh /workspace/gpu.sh &')  # gpu profile
-    print('''
-========================
-network profile started!
-========================''')
+    start_time_jct = time.time()
+    model = train_wav2vec2(strategy, task_type, model_type="pretraining", model_size=model_size)
+    end_time_jct = time.time()
+    jct = end_time_jct - start_time_jct
     
-    # JCT 측정 시작
-    start_time = time.time()
-    start_time_tf = tf.timestamp()
-    
-    # 모델 학습 실행
-    model = train_wav2vec2(strategy, model_type="pretraining", model_size=model_size)
-    
-    # JCT 측정 종료
-    end_time = time.time()
-    jct = end_time - start_time
-    
-    # 결과 출력
-    print("Training completed.")
-    print("jct:", jct)
-    
-    # JCT 파일 저장
-    try:
-        model_txt = open('/workspace/model.txt', 'r')
-        save_dir_name = model_txt.read()
-        jct_file = open('/result/' + save_dir_name.strip() + '/' + task_type + '_' + str(task_index) + '_jct.txt', 'w')
-        jct_file.write('%.2f' % (float(jct)))
-        jct_file.close()
-        model_txt.close()
-    except Exception as e:
-        print(f"JCT 파일 저장 중 오류: {e}")
-    
-    # 모델 저장
-    model_path = os.path.join(CACHE_DIR, f"wav2vec2_{model_size}_model")
-    model.save_weights(model_path)
-    print(f"{model_size.capitalize()} 모델이 {model_path}에 저장되었습니다.")
-
+    if task_type == 'chief':
+        print("Training completed.")
+        print("jct:", jct)
+        try:
+            model_txt_path = '/workspace/model.txt'
+            save_dir_name = "default_save_dir" 
+            if os.path.exists(model_txt_path):
+                with open(model_txt_path, 'r') as f_model_txt:
+                    save_dir_name = f_model_txt.read().strip()
+            
+            result_dir = os.path.join('/result', save_dir_name)
+            os.makedirs(result_dir, exist_ok=True)
+            # JCT 파일명에 task_type과 task_index를 포함하도록 수정
+            jct_file_path = os.path.join(result_dir, f'{task_type}_{task_index}_jct.txt')
+            
+            with open(jct_file_path, 'w') as f_jct:
+                f_jct.write('%.2f' % (float(jct)))
+            print(f"JCT 파일 저장 완료: {jct_file_path}")
+        except Exception as e:
+            print(f"JCT 파일 저장 중 오류: {e}")
+        
+        model_path = os.path.join(CACHE_DIR, f"wav2vec2_{model_size}_model")
+        model.save_weights(model_path)
+        print(f"{model_size.capitalize()} 모델이 {model_path}에 저장되었습니다.")
 
 if __name__ == "__main__":
-    # 명령줄 인자 파싱
     parser = argparse.ArgumentParser(description='wav2vec2 Distributed Speech Recognition')
     parser.add_argument('--num_batches', type=int, default=5, help='num_batches per replica, default is set 5')
     parser.add_argument('--batch_size', type=int, default=1, help='batch size per replica, default is set 1')
@@ -1455,22 +1477,28 @@ if __name__ == "__main__":
                        help='Model size: tiny (~15-20M params), small (~30-40M params), base (~95M params)')
     args = parser.parse_args()
 
-    # 환경 설정
-    tf_config = json.loads(os.environ.get('TF_CONFIG') or '{}')
-    task_config = tf_config.get('task', {})
-    task_type = task_config.get('type')
-    task_index = task_config.get('index')
+    tf_config_env = os.environ.get('TF_CONFIG')
+    if not tf_config_env:
+        print("TF_CONFIG 환경 변수가 설정되지 않았습니다. 단일 워커 모드로 실행될 수 있습니다.")
+        default_tf_config = {
+            'cluster': {
+                'chief': ['localhost:2222']
+            },
+            'task': {'type': 'chief', 'index': 0}
+        }
+        os.environ['TF_CONFIG'] = json.dumps(default_tf_config)
+        print(f"기본 TF_CONFIG 사용: {os.environ['TF_CONFIG']}")
 
-    # 모델과 프로세서를 저장할 로컬 디렉토리 설정
-    CACHE_DIR = '/workspace/model_cache'  # 컨테이너 내 사전 준비된 모델 캐시 경로
-    DATASET_DIR = '/workspace/datasets'  # 컨테이너 내 사전 준비된 데이터셋 경로
+    CACHE_DIR = '/workspace/model_cache'
+    DATASET_DIR = '/workspace/datasets'
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    os.makedirs(DATASET_DIR, exist_ok=True)
+    os.makedirs('/result', exist_ok=True)
 
-    # 분산 학습 전략 설정 - 안정성 개선
     os.environ['GRPC_VERBOSITY'] = 'ERROR'
     os.environ['TF_GRPC_DEFAULT_OPTIONS'] = 'grpc.keepalive_time_ms=30000,grpc.keepalive_timeout_ms=5000,grpc.keepalive_permit_without_calls=1,grpc.http2.max_pings_without_data=0,grpc.http2.min_time_between_pings_ms=10000,grpc.http2.min_ping_interval_without_data_ms=300000'
     os.environ['TF_COLLECTIVE_OP_TIMEOUT'] = '300'
     
-    # 통신 옵션으로 안정성 향상
     communication_options = tf.distribute.experimental.CommunicationOptions(
         implementation=tf.distribute.experimental.CommunicationImplementation.NCCL,
         timeout_seconds=300.0
@@ -1480,14 +1508,16 @@ if __name__ == "__main__":
         communication_options=communication_options
     )
 
-    # 하이퍼파라미터 설정
     BATCH_SIZE_PER_REPLICA = args.batch_size
     GLOBAL_BATCH_SIZE = BATCH_SIZE_PER_REPLICA * strategy.num_replicas_in_sync
     MAX_ITERATIONS = args.num_batches
     BUFFER_SIZE = 10000
 
-    print(f'선택된 모델 크기: {args.model_size}')
-    print(f'batch size per replica: {BATCH_SIZE_PER_REPLICA}, global batch size: {GLOBAL_BATCH_SIZE}')
-    print(f'num_batches: {MAX_ITERATIONS}')
+    tf_config_local = json.loads(os.environ.get('TF_CONFIG') or '{}')
+    task_type_local = tf_config_local.get('task', {}).get('type', 'chief')
+    if task_type_local == 'chief':
+        print(f'선택된 모델 크기: {args.model_size}')
+        print(f'batch size per replica: {BATCH_SIZE_PER_REPLICA}, global batch size: {GLOBAL_BATCH_SIZE}')
+        print(f'num_batches: {MAX_ITERATIONS}')
     
     main(strategy, args.model_size)
