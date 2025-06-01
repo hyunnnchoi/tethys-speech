@@ -549,16 +549,26 @@ class Wav2Vec2Encoder(tf.keras.layers.Layer):
 
 # 프로젝션 헤드 구현
 class Wav2Vec2ProjectionHead(tf.keras.layers.Layer):
+    """Wav2Vec2 프로젝션 헤드 레이어"""
     def __init__(self, config):
-        super(Wav2Vec2ProjectionHead, self).__init__()
-        self.dense = tf.keras.layers.Dense(config.proj_codevector_dim, name="projection_head")
-        self.layer_norm = tf.keras.layers.LayerNormalization(epsilon=config.layer_norm_eps)
-        self.dropout = tf.keras.layers.Dropout(config.hidden_dropout)
-    
+        super().__init__(name="projection_head")
+        self.dense = tf.keras.layers.Dense(config.proj_codevector_dim)
+        self.layer_norm = tf.keras.layers.LayerNormalization()
+        self.dropout = tf.keras.layers.Dropout(config.feat_proj_dropout)
+
     def call(self, hidden_states, training=False):
+        """프로젝션 헤드 순전파"""
+        # 입력이 튜플이나 리스트인 경우 첫 번째 요소만 사용
+        if isinstance(hidden_states, (tuple, list)):
+            hidden_states = hidden_states[0]
+        
+        # 차원 확인 및 재구성
+        if len(tf.shape(hidden_states)) != 3:
+            hidden_states = tf.reshape(hidden_states, [-1, tf.shape(hidden_states)[1], tf.shape(hidden_states)[-1]])
+        
+        hidden_states = self.dropout(hidden_states, training=training)
         hidden_states = self.dense(hidden_states)
         hidden_states = self.layer_norm(hidden_states)
-        hidden_states = self.dropout(hidden_states, training=training)
         return hidden_states
 
 # Wav2Vec2Quantizer 클래스 구현 (수정됨)
@@ -1349,7 +1359,7 @@ def create_full_model(model_type="pretraining",
 # 분산 학습 스텝 정의 (대폭 단순화하여 확실한 작동 보장)
 @tf.function 
 def distributed_train_step_tf_func(strategy, model, dist_inputs, optimizer):
-    """간단하고 확실한 분산 학습 스텝"""
+    """분산 학습을 위한 스텝 함수"""
     
     def train_step(inputs):
         features, labels = inputs
@@ -1360,30 +1370,53 @@ def distributed_train_step_tf_func(strategy, model, dist_inputs, optimizer):
             
             # Wav2Vec2ForPreTraining 모델의 경우
             if isinstance(model, Wav2Vec2ForPreTraining):
-                if "projected_states" in outputs and "projected_quantized_features" in outputs:
+                if ("projected_states" in outputs and 
+                    "projected_quantized_states" in outputs and 
+                    outputs["projected_states"] is not None and 
+                    outputs["projected_quantized_states"] is not None):
+                    
                     # 컨트라스트 손실 계산
-                    logits, contrastive_loss = model._compute_contrastive_loss(
-                        outputs["projected_states"],
-                        outputs["projected_quantized_features"]
+                    projected_states = outputs["projected_states"]
+                    projected_quantized = outputs["projected_quantized_states"]
+                    
+                    # L2 정규화
+                    projected_states = tf.math.l2_normalize(projected_states, axis=-1)
+                    projected_quantized = tf.math.l2_normalize(projected_quantized, axis=-1)
+                    
+                    # 코사인 유사도 계산
+                    logits = tf.matmul(projected_states, projected_quantized, transpose_b=True)
+                    logits = logits / 0.1  # temperature scaling
+                    
+                    # 레이블은 대각선 요소가 1인 행렬 (자기 자신과의 매칭)
+                    labels = tf.eye(tf.shape(logits)[0], dtype=tf.float32)
+                    
+                    # 컨트라스트 손실 계산
+                    contrastive_loss = tf.reduce_mean(
+                        tf.nn.softmax_cross_entropy_with_logits(labels=labels, logits=logits)
                     )
                     
                     # 다양성 손실 추가
                     if "codevector_perplexity" in outputs:
-                        diversity_loss = model._compute_diversity_loss(outputs["codevector_perplexity"])
+                        diversity_loss = -tf.math.log(outputs["codevector_perplexity"])
                     else:
-                        diversity_loss = tf.constant(0.0)
+                        diversity_loss = tf.constant(0.0, dtype=tf.float32)
                     
                     # 최종 손실
-                    loss = contrastive_loss + model.diversity_loss_weight * diversity_loss
+                    loss = contrastive_loss + 0.1 * diversity_loss  # diversity_loss의 가중치 조정
                 else:
-                    loss = tf.constant(0.0)
+                    print("Warning: Required outputs for loss calculation not found")
+                    loss = tf.constant(0.0, dtype=tf.float32)
             else:
                 # 다른 모델 타입의 경우
                 outputs = model(features, labels=labels, training=True)
                 loss = outputs.get("loss", 0.0)
             
-            # NaN 체크
-            loss = tf.where(tf.math.is_nan(loss), tf.constant(0.0), loss)
+            # NaN/Inf 체크 및 처리
+            loss = tf.where(
+                tf.math.is_finite(loss),
+                loss,
+                tf.constant(0.0, dtype=tf.float32)
+            )
             
             # 스케일링
             scaled_loss = loss / tf.cast(strategy.num_replicas_in_sync, tf.float32)
@@ -1391,22 +1424,22 @@ def distributed_train_step_tf_func(strategy, model, dist_inputs, optimizer):
         # 그래디언트 계산
         gradients = tape.gradient(scaled_loss, model.trainable_variables)
         
-        # None 그래디언트 필터링
+        # None 그래디언트 필터링 및 클리핑
         gradients = [
-            tf.zeros_like(var) if grad is None else grad 
+            tf.clip_by_norm(
+                tf.zeros_like(var) if grad is None else grad,
+                1.0
+            )
             for grad, var in zip(gradients, model.trainable_variables)
         ]
-        
-        # 그래디언트 클리핑
-        gradients, _ = tf.clip_by_global_norm(gradients, 1.0)
         
         # 옵티마이저 적용
         optimizer.apply_gradients(zip(gradients, model.trainable_variables))
         
-        return scaled_loss
+        return loss  # 원래 손실값 반환 (스케일링되지 않은)
     
     per_replica_losses = strategy.run(train_step, args=(dist_inputs,))
-    return strategy.reduce(tf.distribute.ReduceOp.SUM, per_replica_losses, axis=None)
+    return strategy.reduce(tf.distribute.ReduceOp.MEAN, per_replica_losses, axis=None)
 
 # wav2vec2 모델 메인 학습 함수 (수정됨)
 def train_wav2vec2(strategy, task_type, model_type="pretraining", model_size="small", num_epochs=1, learning_rate=3e-5):
