@@ -1462,12 +1462,12 @@ if __name__ == "__main__":
     # 분산 학습 전략 설정 - 안정성 개선
     os.environ['GRPC_VERBOSITY'] = 'ERROR'
     os.environ['TF_GRPC_DEFAULT_OPTIONS'] = 'grpc.keepalive_time_ms=30000,grpc.keepalive_timeout_ms=5000,grpc.keepalive_permit_without_calls=true,grpc.http2.max_pings_without_data=0,grpc.http2.min_time_between_pings_ms=10000,grpc.http2.min_ping_interval_without_data_ms=300000'
-    os.environ['TF_COLLECTIVE_OP_TIMEOUT'] = '120'
+    os.environ['TF_COLLECTIVE_OP_TIMEOUT'] = '300'
     
     # 통신 옵션으로 안정성 향상
     communication_options = tf.distribute.experimental.CommunicationOptions(
         implementation=tf.distribute.experimental.CommunicationImplementation.NCCL,
-        timeout_seconds=120.0
+        timeout_seconds=300.0
     )
     
     strategy = tf.distribute.MultiWorkerMirroredStrategy(
