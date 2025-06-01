@@ -1210,15 +1210,13 @@ def create_full_model(model_type="pretraining",
         return Wav2Vec2Model(config)
 
 
-# 분산 학습 스텝 정의 (수정됨)
-def distributed_train_step(strategy, model, dist_inputs, optimizer, task_type, step_num):
-    """개선된 분산 학습 스텝"""
-
-    # train_step 함수 내부에서 직접 psutil 호출은 tf.function 컨텍스트 문제로 어려울 수 있음
-    # 대신 distributed_train_step 함수 호출 시점에서 로깅 (아래 train_wav2vec2 루프에서 수행)
+# 분산 학습 스텝 정의 (수정됨 - @tf.function 추가)
+@tf.function # 전체 함수를 tf.function으로 감쌈
+def distributed_train_step_tf_func(strategy, model, dist_inputs, optimizer):
+    """개선된 분산 학습 스텝 (tf.function으로 컴파일)"""
     
     def train_step(inputs):
-        features, labels = inputs
+        features, labels = inputs # labels는 현재 더미 데이터에서 사용 안 함
         batch_size = tf.shape(features)[0]
 
         def empty_batch_fn():
@@ -1227,6 +1225,7 @@ def distributed_train_step(strategy, model, dist_inputs, optimizer, task_type, s
         def normal_batch_fn():
             with tf.GradientTape() as tape:
                 outputs = model(features, training=True)
+                loss = tf.constant(0.0, dtype=tf.float32) # 기본 손실값 초기화
                 if isinstance(model, Wav2Vec2ForPreTraining):
                     if "projected_states" in outputs and "projected_quantized_features" in outputs:
                         _, contrastive_loss = model._compute_contrastive_loss(
@@ -1235,24 +1234,42 @@ def distributed_train_step(strategy, model, dist_inputs, optimizer, task_type, s
                         )
                         diversity_loss = model._compute_diversity_loss(outputs.get("codevector_perplexity", tf.constant(0.0)))
                         loss = contrastive_loss + model.diversity_loss_weight * diversity_loss
-                    else:
-                        loss = tf.constant(0.0)
+                    # else: loss는 이미 0.0으로 초기화됨
                 else:
-                    # ASR이나 Classification의 경우 labels를 전달해야 할 수 있음 (현재 더미 데이터는 labels 사용 안함)
-                    # outputs = model(features, labels=labels, training=True) 
-                    outputs = model(features, training=True) # Wav2Vec2Model은 labels 안 받음
-                    loss = outputs.get("loss", tf.constant(0.0)) # 모델이 loss를 반환한다고 가정
+                    # Wav2Vec2Model의 경우, 또는 다른 CTC/SequenceClassification 모델의 경우
+                    # 모델 자체에서 loss를 계산하거나, 여기서 추가적인 손실 계산 로직 필요
+                    # 예시: outputs가 딕셔너리이고 "loss" 키를 포함한다고 가정
+                    # 현재 Wav2Vec2Model은 loss를 직접 반환하지 않으므로, pre-training 모델이 아니면 이 부분 수정 필요
+                    # For ASR (CTC) or SequenceClassification, model call might need labels and return loss.
+                    # outputs = model(features, labels=labels, training=True) # if model accepts labels
+                    calculated_loss = outputs.get("loss") # 모델이 loss를 반환한다면
+                    if calculated_loss is not None:
+                        loss = calculated_loss
+                    # else: loss는 이미 0.0으로 초기화됨 (또는 에러 처리)
                 
-                loss = tf.where(tf.math.is_nan(loss), tf.constant(0.0), loss)
+                loss = tf.where(tf.math.is_nan(loss), tf.constant(0.0, dtype=tf.float32), loss)
                 scaled_loss = loss / tf.cast(strategy.num_replicas_in_sync, tf.float32)
             
             gradients = tape.gradient(scaled_loss, model.trainable_variables)
-            gradients = [
-                tf.zeros_like(var) if grad is None else grad 
-                for grad, var in zip(gradients, model.trainable_variables)
-            ]
-            gradients, _ = tf.clip_by_global_norm(gradients, 1.0)
-            optimizer.apply_gradients(zip(gradients, model.trainable_variables))
+            # Filter out None gradients (if any, though less common with default initializers)
+            trainable_vars = model.trainable_variables
+            filtered_gradients = []
+            for i, grad in enumerate(gradients):
+                if grad is None:
+                    filtered_gradients.append(tf.zeros_like(trainable_vars[i]))
+                else:
+                    filtered_gradients.append(grad)
+            
+            # Apply gradients if they are not all zero (or handle appropriately)
+            # This check might be overly cautious if losses are always non-zero and models are complex enough.
+            # gradients, _ = tf.clip_by_global_norm(filtered_gradients, 1.0)
+            # optimizer.apply_gradients(zip(gradients, trainable_vars))
+            
+            # Consider if optimizer should be applied if all gradients are zero (e.g. from empty batch or all None grads)
+            # For now, assume optimizer.apply_gradients handles it or clipping is sufficient.
+            clipped_gradients, _ = tf.clip_by_global_norm(filtered_gradients, 1.0)
+            optimizer.apply_gradients(zip(clipped_gradients, trainable_vars))
+
             return scaled_loss
         
         return tf.cond(tf.equal(batch_size, 0), empty_batch_fn, normal_batch_fn)
@@ -1305,25 +1322,24 @@ def train_wav2vec2(strategy, task_type, model_type="pretraining", model_size="sm
             print(f"Epoch {epoch+1}/{num_epochs}")
         
         for i in range(MAX_ITERATIONS):
-            if task_type == 'chief' and i % 5 == 0: # 5 스텝마다 distributed_train_step 호출 전 로깅
-                print(f"--- distributed_train_step 호출 전 (Epoch: {epoch+1}, Iter: {i}, Global Step: {step}) --- ")
+            if task_type == 'chief' and i % 5 == 0: 
+                print(f"--- distributed_train_step_tf_func 호출 전 (Epoch: {epoch+1}, Iter: {i}, Global Step: {step}) --- ")
                 log_system_resources()
 
             try:
                 inputs = next(iterator)
                 step_start = time.time()
-                loss = distributed_train_step(strategy, model, inputs, optimizer, task_type, step)
+                # @tf.function으로 데코레이트된 함수 호출
+                loss = distributed_train_step_tf_func(strategy, model, inputs, optimizer)
                 step_end = time.time()
                 step_duration = step_end - step_start
                 elapsed = step_end - start_time
-                
                 if task_type == 'chief':
                     try: loss_value = float(loss)
                     except: loss_value = 0.0
                     print(f"Step {step}, Loss: {loss_value:.4f}, Time: {time.strftime('%H:%M:%S')} (경과: {elapsed:.2f}초, 스텝 시간: {step_duration:.2f}초)")
                     if step % 1 == 0: 
                         log_system_resources()
-                
                 step += 1
                 if task_type == 'chief' and step % 50 == 0:
                     checkpoint.save(os.path.join(checkpoint_dir, f"model_step_{step}"))
@@ -1331,18 +1347,16 @@ def train_wav2vec2(strategy, task_type, model_type="pretraining", model_size="sm
                 iterator = iter(dist_dataset)
                 inputs = next(iterator)
                 step_start = time.time()
-                loss = distributed_train_step(strategy, model, inputs, optimizer, task_type, step)
+                loss = distributed_train_step_tf_func(strategy, model, inputs, optimizer)
                 step_end = time.time()
                 step_duration = step_end - step_start
                 elapsed = step_end - start_time
-                
                 if task_type == 'chief':
                     try: loss_value = float(loss)
                     except: loss_value = 0.0
                     print(f"Step {step}, Loss: {loss_value:.4f}, Time: {time.strftime('%H:%M:%S')} (경과: {elapsed:.2f}초, 스텝 시간: {step_duration:.2f}초)")
                     if step % 1 == 0: 
                         log_system_resources()
-                
                 step += 1
             except Exception as e:
                 if task_type == 'chief':
