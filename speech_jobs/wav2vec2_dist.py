@@ -24,109 +24,62 @@ import psutil # psutil 추가
 
 class Wav2Vec2Config:
     def __init__(self, model_size="small"):
-        # 모델 크기에 따른 설정
-        if model_size == "small":
-            # Small 모델 설정 (약 30-40M 파라미터)
-            self.hidden_size = 512
-            self.num_hidden_layers = 6
-            self.num_attention_heads = 8
-            self.intermediate_size = 2048
-            self.conv_dim = [256, 256, 256, 256, 256]  # 5 layers, 채널 수 줄임
-            self.conv_stride = [5, 2, 2, 2, 2]
-            self.conv_kernel = [10, 3, 3, 3, 2]
-            self.num_conv_pos_embeddings = 64  # 128 → 64
-            self.num_conv_pos_embedding_groups = 8  # 16 → 8
-            
-        elif model_size == "tiny":
-            # Tiny 모델 설정 (약 15-20M 파라미터)
-            self.hidden_size = 256
-            self.num_hidden_layers = 4
-            self.num_attention_heads = 4
-            self.intermediate_size = 1024
-            self.conv_dim = [128, 128, 128, 128]  # 4 layers
-            self.conv_stride = [5, 2, 2, 2]
-            self.conv_kernel = [10, 3, 3, 2]
-            self.num_conv_pos_embeddings = 32
-            self.num_conv_pos_embedding_groups = 4
-            
-        else:  # base 모델 (기존 설정)
-            self.hidden_size = 768
-            self.num_hidden_layers = 12
-            self.num_attention_heads = 12
-            self.intermediate_size = 3072
-            self.conv_dim = [512, 512, 512, 512, 512, 512, 512]
-            self.conv_stride = [5, 2, 2, 2, 2, 2, 2]
-            self.conv_kernel = [10, 3, 3, 3, 3, 2, 2]
-            self.num_conv_pos_embeddings = 128
-            self.num_conv_pos_embedding_groups = 16
-
-        # 특징 추출기 설정
-        self.feat_extract_norm = "group"
-        self.feat_extract_activation = "gelu"
-        self.conv_bias = False
-        
-        # 공통 설정들
+        # 기본 설정
+        self.hidden_size = 768
+        self.num_hidden_layers = 12
+        self.num_attention_heads = 12
+        self.intermediate_size = 3072
         self.hidden_act = "gelu"
         self.hidden_dropout = 0.1
         self.activation_dropout = 0.1
         self.attention_dropout = 0.1
+        self.feat_proj_dropout = 0.0  # 특징 프로젝션 드롭아웃
+        self.final_dropout = 0.1
+        self.layerdrop = 0.1
         self.layer_norm_eps = 1e-5
+        self.initializer_range = 0.02
+        self.vocab_size = 32
         
-        # 양자화 및 마스킹 설정 (small 모델에 맞게 조정)
-        if model_size == "small":
-            self.num_codevectors_per_group = 160  # 320 → 160
-            self.num_codevector_groups = 2
-            self.codevector_dim = 128  # 256 → 128
-            self.proj_codevector_dim = 128  # 256 → 128
-        elif model_size == "tiny":
-            self.num_codevectors_per_group = 80
-            self.num_codevector_groups = 2
-            self.codevector_dim = 64
-            self.proj_codevector_dim = 64
-        else:  # base
-            self.num_codevectors_per_group = 320
-            self.num_codevector_groups = 2
-            self.codevector_dim = 256
-            self.proj_codevector_dim = 256
-            
-        self.contrastive_logits_temperature = 0.1
-        self.num_negatives = 100
+        # 특징 추출기 설정
+        self.conv_dim = [512, 512, 512, 512, 512, 512, 512]
+        self.conv_stride = [5, 2, 2, 2, 2, 2, 2]
+        self.conv_kernel = [10, 3, 3, 3, 3, 2, 2]
+        self.conv_bias = False
+        
+        # 양자화 설정
+        self.num_codevectors_per_group = 320
+        self.num_codevector_groups = 2
+        self.codevector_dim = 256
+        
+        # 프로젝션 설정
+        self.proj_codevector_dim = 256
         self.diversity_loss_weight = 0.1
-        self.ctc_loss_reduction = "sum"
-        self.ctc_zero_infinity = False
         
-        # 미세 조정 설정
+        # 위치 임베딩 설정
+        self.num_conv_pos_embeddings = 128
+        self.num_conv_pos_embedding_groups = 16
+        self.do_stable_layer_norm = True
+        self.apply_spec_augment = True
         self.mask_time_prob = 0.05
         self.mask_time_length = 10
+        self.mask_time_min_masks = 2
         self.mask_feature_prob = 0.0
         self.mask_feature_length = 10
+        self.mask_feature_min_masks = 0
         
-        # 추가 설정
-        self.vocab_size = 32
-        self.do_stable_layer_norm = True
-        self.use_weighted_layer_sum = False
-        
-        # 분류 관련 설정 (small 모델에 맞게 조정)
-        if model_size == "small":
-            self.classifier_proj_size = 128  # 256 → 128
-        elif model_size == "tiny":
-            self.classifier_proj_size = 64
-        else:
-            self.classifier_proj_size = 256
-            
-        # TDNN 설정도 작게 조정
-        if model_size == "small":
-            self.tdnn_dim = [256, 256, 256, 256, 768]
-            self.xvector_output_dim = 256
-        elif model_size == "tiny":
-            self.tdnn_dim = [128, 128, 128, 128, 384]
-            self.xvector_output_dim = 128
-        else:
-            self.tdnn_dim = [512, 512, 512, 512, 1500]
-            self.xvector_output_dim = 512
-            
-        self.tdnn_kernel = [5, 3, 3, 1, 1]
-        self.tdnn_dilation = [1, 2, 3, 1, 1]
+        # 모델 크기별 설정
+        if model_size == "tiny":
+            self.hidden_size = 384
+            self.num_hidden_layers = 6
+            self.num_attention_heads = 6
+            self.intermediate_size = 1536
+            self.conv_dim = [256, 256, 256, 256, 256, 256, 256]
+        elif model_size == "base":
+            self.hidden_size = 768
+            self.num_hidden_layers = 12
+            self.num_attention_heads = 12
+            self.intermediate_size = 3072
+        # small은 기본값 사용
 
 
 # Gelu 활성화 함수 정의
