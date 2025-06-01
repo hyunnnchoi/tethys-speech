@@ -16,6 +16,315 @@ TENSOR_SIZE_TRACKER = {
 }
 
 
+class TensorProfiler:
+    """Tiresias 논문과 같은 방식으로 텐서 사이즈를 측정하는 고급 프로파일러"""
+    
+    def __init__(self, log_dir='/workspace/tensor_logs'):
+        self.log_dir = log_dir
+        self.current_step = 0
+        self.current_step_size = 0
+        self.step_tensor_sizes = []
+        self.operation_tensor_sizes = {}
+        self.tensor_details = []
+        self.gradient_sizes = []
+        self.parameter_sizes = []
+        self.memory_usage = []
+        
+        # 로그 파일 초기화
+        os.makedirs(log_dir, exist_ok=True)
+        
+        # 텐서 사이즈 로그 파일
+        self.tensor_log_file = open(os.path.join(log_dir, 'tensor_sizes.txt'), 'w')
+        self.tensor_log_file.write("step,operation,tensor_type,size_bytes,size_mb,shape\n")
+        
+        # 메모리 사용량 로그 파일  
+        self.memory_log_file = open(os.path.join(log_dir, 'memory_usage.txt'), 'w')
+        self.memory_log_file.write("step,gpu_memory_mb,cpu_memory_mb\n")
+        
+        # 요약 로그 파일
+        self.summary_log_file = open(os.path.join(log_dir, 'summary.txt'), 'w')
+        self.summary_log_file.write("step,total_tensor_size_mb,num_operations,avg_tensor_size_mb\n")
+        
+        # Tiresias 스타일 텐서 사이즈 로그 파일
+        self.tiresias_log_file = open(os.path.join(log_dir, 'tiresias_tensorsize.txt'), 'w')
+        self.tiresias_log_file.write("step,tensorsize_mb\n")
+        
+        print(f"🔍 TensorProfiler 초기화됨 - 로그 디렉토리: {log_dir}")
+    
+    def log_tensor_size(self, tensor, name, tensor_type="activation"):
+        """텐서 사이즈를 로깅"""
+        if tensor is None:
+            return 0
+            
+        try:
+            # 텐서 크기 계산
+            size_bytes = self._calculate_tensor_size(tensor)
+            size_mb = size_bytes / (1024 * 1024)
+            
+            # 형태 정보 가져오기
+            try:
+                shape = tensor.shape.as_list() if hasattr(tensor.shape, 'as_list') else list(tensor.shape)
+            except:
+                shape = "unknown"
+            
+            # 현재 스텝 크기에 추가
+            self.current_step_size += size_bytes
+            
+            # Operation별 크기 추적
+            if name not in self.operation_tensor_sizes:
+                self.operation_tensor_sizes[name] = []
+            self.operation_tensor_sizes[name].append(size_bytes)
+            
+            # 상세 정보 저장
+            tensor_info = {
+                'step': self.current_step,
+                'operation': name,
+                'tensor_type': tensor_type,
+                'size_bytes': size_bytes,
+                'size_mb': size_mb,
+                'shape': shape
+            }
+            self.tensor_details.append(tensor_info)
+            
+            # 파일에 즉시 로깅 (메모리 절약)
+            self.tensor_log_file.write(f"{self.current_step},{name},{tensor_type},{size_bytes},{size_mb:.4f},{shape}\n")
+            self.tensor_log_file.flush()
+            
+            return size_bytes
+            
+        except Exception as e:
+            print(f"텐서 사이즈 로깅 오류: {e}")
+            return 0
+    
+    def log_gradients(self, gradients, variables):
+        """그래디언트 텐서들의 사이즈를 로깅"""
+        for i, (grad, var) in enumerate(zip(gradients, variables)):
+            if grad is not None:
+                var_name = getattr(var, 'name', f'variable_{i}')
+                self.log_tensor_size(grad, f"gradient_{var_name}", "gradient")
+    
+    def log_model_parameters(self, model):
+        """모델 파라미터들의 사이즈를 로깅"""
+        total_params = 0
+        trainable_params = 0
+        
+        for var in model.trainable_variables:
+            param_size = self.log_tensor_size(var, f"param_{var.name}", "parameter")
+            total_params += param_size
+            trainable_params += param_size
+        
+        for var in model.non_trainable_variables:
+            param_size = self.log_tensor_size(var, f"param_{var.name}", "parameter")
+            total_params += param_size
+        
+        # 파라미터 통계 저장
+        param_stats = {
+            'step': self.current_step,
+            'total_parameters_mb': total_params / (1024 * 1024),
+            'trainable_parameters_mb': trainable_params / (1024 * 1024),
+            'non_trainable_parameters_mb': (total_params - trainable_params) / (1024 * 1024)
+        }
+        self.parameter_sizes.append(param_stats)
+        
+        return param_stats
+    
+    def log_memory_usage(self):
+        """GPU 및 CPU 메모리 사용량을 로깅"""
+        try:
+            # GPU 메모리 사용량
+            gpu_memory = 0
+            if tf.config.list_physical_devices('GPU'):
+                try:
+                    # TensorFlow GPU 메모리 정보 가져오기
+                    gpu_details = tf.config.experimental.get_memory_info('GPU:0')
+                    gpu_memory = gpu_details['current'] / (1024 * 1024)  # MB 단위
+                except:
+                    # 대안 방법
+                    try:
+                        import subprocess
+                        result = subprocess.run(['nvidia-smi', '--query-gpu=memory.used', '--format=csv,nounits,noheader'], 
+                                              capture_output=True, text=True)
+                        if result.returncode == 0:
+                            gpu_memory = float(result.stdout.strip())
+                    except:
+                        gpu_memory = 0
+            
+            # CPU 메모리 사용량
+            cpu_memory = 0
+            try:
+                import psutil
+                process = psutil.Process()
+                cpu_memory = process.memory_info().rss / (1024 * 1024)  # MB 단위
+            except:
+                cpu_memory = 0
+            
+            # 메모리 사용량 저장
+            memory_info = {
+                'step': self.current_step,
+                'gpu_memory_mb': gpu_memory,
+                'cpu_memory_mb': cpu_memory
+            }
+            self.memory_usage.append(memory_info)
+            
+            # 파일에 로깅
+            self.memory_log_file.write(f"{self.current_step},{gpu_memory:.2f},{cpu_memory:.2f}\n")
+            self.memory_log_file.flush()
+            
+            return memory_info
+            
+        except Exception as e:
+            print(f"메모리 사용량 로깅 오류: {e}")
+            return {'step': self.current_step, 'gpu_memory_mb': 0, 'cpu_memory_mb': 0}
+    
+    def start_step(self, step):
+        """새로운 스텝 시작"""
+        self.current_step = step
+        self.current_step_size = 0
+        print(f"📊 Step {step} 텐서 프로파일링 시작")
+    
+    def end_step(self):
+        """현재 스텝 종료 및 결과 저장"""
+        step_size_mb = self.current_step_size / (1024 * 1024)
+        self.step_tensor_sizes.append(step_size_mb)
+        
+        # 요약 정보 저장
+        num_ops = len([detail for detail in self.tensor_details if detail['step'] == self.current_step])
+        avg_tensor_size = step_size_mb / num_ops if num_ops > 0 else 0
+        
+        # 파일에 요약 정보 로깅
+        self.summary_log_file.write(f"{self.current_step},{step_size_mb:.4f},{num_ops},{avg_tensor_size:.4f}\n")
+        self.summary_log_file.flush()
+        
+        # Tiresias 스타일 텐서 사이즈 로깅
+        self.tiresias_log_file.write(f"{self.current_step},{step_size_mb:.4f}\n")
+        self.tiresias_log_file.flush()
+        
+        print(f"📊 Step {self.current_step} 완료 - TensorSize: {step_size_mb:.2f} MB")
+        
+        return step_size_mb
+    
+    def get_tiresias_tensorsize(self):
+        """Tiresias 논문과 같은 방식으로 텐서 사이즈 계산"""
+        if len(self.step_tensor_sizes) == 0:
+            return 0
+        
+        # 처음 몇 스텝은 안정화 시간으로 제외 (워밍업)
+        warmup_steps = min(3, len(self.step_tensor_sizes) // 4)
+        stable_steps = self.step_tensor_sizes[warmup_steps:]
+        
+        if len(stable_steps) == 0:
+            return np.mean(self.step_tensor_sizes) if self.step_tensor_sizes else 0
+        
+        # 안정화된 스텝들의 평균으로 tensorsize 계산
+        tiresias_tensorsize = np.mean(stable_steps)
+        
+        return tiresias_tensorsize
+    
+    def get_summary(self):
+        """전체 프로파일링 결과 요약"""
+        if not self.step_tensor_sizes:
+            return {}
+        
+        tiresias_tensorsize = self.get_tiresias_tensorsize()
+        
+        summary = {
+            'total_steps': len(self.step_tensor_sizes),
+            'tiresias_tensorsize_mb': tiresias_tensorsize,
+            'avg_step_tensorsize_mb': np.mean(self.step_tensor_sizes),
+            'max_step_tensorsize_mb': np.max(self.step_tensor_sizes),
+            'min_step_tensorsize_mb': np.min(self.step_tensor_sizes),
+            'std_step_tensorsize_mb': np.std(self.step_tensor_sizes),
+            'total_operations': len(self.tensor_details),
+            'step_tensor_sizes': self.step_tensor_sizes
+        }
+        
+        # Operation별 통계
+        op_stats = {}
+        for op_name, sizes in self.operation_tensor_sizes.items():
+            op_stats[op_name] = {
+                'total_size_mb': sum(sizes) / (1024 * 1024),
+                'avg_size_mb': np.mean(sizes) / (1024 * 1024),
+                'count': len(sizes)
+            }
+        
+        summary['operation_stats'] = op_stats
+        
+        return summary
+    
+    def save_final_results(self):
+        """최종 결과를 파일에 저장"""
+        summary = self.get_summary()
+        
+        # JSON 형태로 저장
+        with open(os.path.join(self.log_dir, 'final_summary.json'), 'w') as f:
+            json.dump(summary, f, indent=2, default=str)
+        
+        # Tiresias 결과 저장
+        tiresias_result = {
+            'model': 'whisper_small',
+            'tensorsize_mb': summary['tiresias_tensorsize_mb'],
+            'total_steps': summary['total_steps'],
+            'measurement_method': 'Tiresias_style'
+        }
+        
+        with open(os.path.join(self.log_dir, 'tiresias_result.json'), 'w') as f:
+            json.dump(tiresias_result, f, indent=2)
+        
+        return summary
+    
+    def _calculate_tensor_size(self, tensor):
+        """텐서의 메모리 사이즈를 바이트 단위로 계산"""
+        try:
+            if tensor is None:
+                return 0
+            
+            # 텐서의 모든 요소 개수 계산
+            if hasattr(tensor, 'shape'):
+                total_elements = tf.size(tensor).numpy() if hasattr(tf.size(tensor), 'numpy') else 1
+                for dim in tensor.shape:
+                    if dim is not None:
+                        total_elements = total_elements if hasattr(tf.size(tensor), 'numpy') else total_elements * int(dim)
+            else:
+                total_elements = 1
+            
+            # 데이터 타입별 바이트 크기
+            dtype_size = tensor.dtype.size if hasattr(tensor, 'dtype') else 4  # 기본값 4바이트
+            
+            return int(total_elements * dtype_size)
+        except Exception as e:
+            print(f"텐서 크기 계산 오류: {e}")
+            return 0
+    
+    def close(self):
+        """프로파일러 종료 및 파일 닫기"""
+        try:
+            self.tensor_log_file.close()
+            self.memory_log_file.close()
+            self.summary_log_file.close()
+            self.tiresias_log_file.close()
+            print(f"🔍 TensorProfiler 종료됨")
+        except:
+            pass
+
+
+class TensorLoggingMixin:
+    """레이어에 텐서 로깅 기능을 추가하는 믹스인 클래스"""
+    
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.profiler = None
+    
+    def set_profiler(self, profiler):
+        """프로파일러 설정"""
+        self.profiler = profiler
+    
+    def log_tensor_if_profiler(self, tensor, name, tensor_type="activation"):
+        """프로파일러가 설정된 경우 텐서 로깅"""
+        if self.profiler is not None:
+            return self.profiler.log_tensor_size(tensor, name, tensor_type)
+        return 0
+
+
 class TensorSizeMonitor:
     """텐서 사이즈를 모니터링하는 클래스"""
     
@@ -113,7 +422,7 @@ class WhisperConfig:
 
 
 # 위치 인코딩
-class PositionalEncoding(tf.keras.layers.Layer):
+class PositionalEncoding(tf.keras.layers.Layer, TensorLoggingMixin):
     def __init__(self, d_model, max_len=5000):
         super(PositionalEncoding, self).__init__()
         self.d_model = d_model
@@ -132,15 +441,17 @@ class PositionalEncoding(tf.keras.layers.Layer):
     
     def call(self, x):
         # x: [batch_size, seq_len, d_model]
+        self.log_tensor_if_profiler(x, "positional_encoding_input")
         tensor_monitor.track_tensor(x, "positional_encoding_input")
         seq_len = tf.shape(x)[1]
         result = x + self.pe[:, :seq_len, :]
+        self.log_tensor_if_profiler(result, "positional_encoding_output")
         tensor_monitor.track_tensor(result, "positional_encoding_output")
         return result
 
 
 # 멀티헤드 어텐션 구현
-class MultiHeadAttention(tf.keras.layers.Layer):
+class MultiHeadAttention(tf.keras.layers.Layer, TensorLoggingMixin):
     def __init__(self, config, is_decoder=False, is_cross_attention=False):
         super(MultiHeadAttention, self).__init__()
         self.is_decoder = is_decoder
@@ -181,6 +492,7 @@ class MultiHeadAttention(tf.keras.layers.Layer):
         attention_mask: 어텐션 마스크 [batch_size, seq_len, kv_seq_len]
         past_key_value: 캐싱된 키/값 (디코더에서 사용)
         """
+        self.log_tensor_if_profiler(hidden_states, "attention_hidden_states_input")
         tensor_monitor.track_tensor(hidden_states, "attention_hidden_states_input")
         
         batch_size = tf.shape(hidden_states)[0]
@@ -193,6 +505,8 @@ class MultiHeadAttention(tf.keras.layers.Layer):
             # cross-attention인 경우 key_value_states에서 key와 value 추출
             key_states = self._reshape(self.k_proj(key_value_states))  # [batch, num_heads, kv_seq_len, head_dim]
             value_states = self._reshape(self.v_proj(key_value_states))  # [batch, num_heads, kv_seq_len, head_dim]
+            self.log_tensor_if_profiler(key_states, "cross_attention_key_states")
+            self.log_tensor_if_profiler(value_states, "cross_attention_value_states")
             tensor_monitor.track_tensor(key_states, "cross_attention_key_states")
             tensor_monitor.track_tensor(value_states, "cross_attention_value_states")
             kv_seq_len = tf.shape(key_states)[2]
@@ -204,6 +518,8 @@ class MultiHeadAttention(tf.keras.layers.Layer):
             # 과거 키/값과 현재 키/값 연결
             key_states = tf.concat([past_key_value[0], key_states], axis=2)
             value_states = tf.concat([past_key_value[1], value_states], axis=2)
+            self.log_tensor_if_profiler(key_states, "past_key_states")
+            self.log_tensor_if_profiler(value_states, "past_value_states")
             tensor_monitor.track_tensor(key_states, "past_key_states")
             tensor_monitor.track_tensor(value_states, "past_value_states")
             kv_seq_len = tf.shape(key_states)[2]
@@ -211,12 +527,15 @@ class MultiHeadAttention(tf.keras.layers.Layer):
             # 일반적인 self-attention
             key_states = self._reshape(self.k_proj(hidden_states))  # [batch, num_heads, seq_len, head_dim]
             value_states = self._reshape(self.v_proj(hidden_states))  # [batch, num_heads, seq_len, head_dim]
+            self.log_tensor_if_profiler(key_states, "self_attention_key_states")
+            self.log_tensor_if_profiler(value_states, "self_attention_value_states")
             tensor_monitor.track_tensor(key_states, "self_attention_key_states")
             tensor_monitor.track_tensor(value_states, "self_attention_value_states")
             kv_seq_len = seq_len
         
         # 항상 쿼리는 현재 hidden_states에서 계산
         query_states = self._reshape(self.q_proj(hidden_states) * self.scaling)  # [batch, num_heads, seq_len, head_dim]
+        self.log_tensor_if_profiler(query_states, "attention_query_states")
         tensor_monitor.track_tensor(query_states, "attention_query_states")
         
         # 현재 키/값 저장 (디코더에서 캐싱 시 사용)
@@ -224,6 +543,7 @@ class MultiHeadAttention(tf.keras.layers.Layer):
         
         # 어텐션 스코어 계산: [batch, num_heads, seq_len, kv_seq_len]
         attention_scores = tf.matmul(query_states, key_states, transpose_b=True)
+        self.log_tensor_if_profiler(attention_scores, "attention_scores")
         tensor_monitor.track_tensor(attention_scores, "attention_scores")
         
         # 어텐션 마스크 적용 (존재하는 경우)
@@ -232,10 +552,12 @@ class MultiHeadAttention(tf.keras.layers.Layer):
             attention_mask = tf.cast(attention_mask, tf.float32)
             attention_mask = (1.0 - attention_mask) * -1e9
             attention_scores = attention_scores + attention_mask
+            self.log_tensor_if_profiler(attention_mask, "attention_mask")
             tensor_monitor.track_tensor(attention_mask, "attention_mask")
         
         # 소프트맥스 적용
         attention_probs = tf.nn.softmax(attention_scores, axis=-1)
+        self.log_tensor_if_profiler(attention_probs, "attention_probs")
         tensor_monitor.track_tensor(attention_probs, "attention_probs")
         
         # 드롭아웃 적용
@@ -247,6 +569,7 @@ class MultiHeadAttention(tf.keras.layers.Layer):
         
         # 어텐션 출력 계산
         attention_output = tf.matmul(attention_probs, value_states)  # [batch, num_heads, seq_len, head_dim]
+        self.log_tensor_if_profiler(attention_output, "attention_output_raw")
         tensor_monitor.track_tensor(attention_output, "attention_output_raw")
         
         # 출력 형태 변환
@@ -255,13 +578,14 @@ class MultiHeadAttention(tf.keras.layers.Layer):
         
         # 최종 선형 변환
         attention_output = self.out_proj(attention_output)
+        self.log_tensor_if_profiler(attention_output, "attention_output_final")
         tensor_monitor.track_tensor(attention_output, "attention_output_final")
         
         return attention_output, attention_probs, past_key_value
 
 
 # 피드포워드 네트워크
-class FeedForward(tf.keras.layers.Layer):
+class FeedForward(tf.keras.layers.Layer, TensorLoggingMixin):
     def __init__(self, config, is_decoder=False):
         super(FeedForward, self).__init__()
         if is_decoder:
@@ -282,19 +606,24 @@ class FeedForward(tf.keras.layers.Layer):
         self.dropout = tf.keras.layers.Dropout(dropout)
     
     def call(self, hidden_states, training=False):
+        self.log_tensor_if_profiler(hidden_states, "feedforward_input")
         tensor_monitor.track_tensor(hidden_states, "feedforward_input")
         
         hidden_states = self.fc1(hidden_states)
+        self.log_tensor_if_profiler(hidden_states, "feedforward_fc1_output")
         tensor_monitor.track_tensor(hidden_states, "feedforward_fc1_output")
         
         hidden_states = self.activation_fn(hidden_states)
+        self.log_tensor_if_profiler(hidden_states, "feedforward_activation_output")
         tensor_monitor.track_tensor(hidden_states, "feedforward_activation_output")
         
         hidden_states = self.activation_dropout(hidden_states, training=training)
         hidden_states = self.fc2(hidden_states)
+        self.log_tensor_if_profiler(hidden_states, "feedforward_fc2_output")
         tensor_monitor.track_tensor(hidden_states, "feedforward_fc2_output")
         
         hidden_states = self.dropout(hidden_states, training=training)
+        self.log_tensor_if_profiler(hidden_states, "feedforward_final_output")
         tensor_monitor.track_tensor(hidden_states, "feedforward_final_output")
         
         return hidden_states
@@ -968,7 +1297,6 @@ def create_dummy_dataset(batch_size, n_mels=80, seq_len=3000, max_target_length=
     return dataset.batch(batch_size).repeat()
 
 
-# 텐서 사이즈 측정을 포함한 분산 학습 스텝 정의
 @tf.function
 def distributed_train_step(strategy, model, dist_inputs, optimizer):
     """분산 학습을 위한 스텝 함수 (텐서 사이즈 측정 포함)"""
@@ -1008,6 +1336,198 @@ def distributed_train_step(strategy, model, dist_inputs, optimizer):
     
     # 손실 값 집계
     return strategy.reduce(tf.distribute.ReduceOp.SUM, per_replica_losses, axis=None)
+
+
+def setup_model_profiling(model, profiler):
+    """모델의 모든 레이어에 프로파일러를 설정"""
+    def set_profiler_recursive(layer):
+        if hasattr(layer, 'set_profiler'):
+            layer.set_profiler(profiler)
+        
+        # 하위 레이어들에도 재귀적으로 적용
+        if hasattr(layer, 'layers'):
+            for sublayer in layer.layers:
+                set_profiler_recursive(sublayer)
+        
+        # 모든 속성을 확인하여 레이어인 것들에 적용
+        for attr_name in dir(layer):
+            if not attr_name.startswith('_'):
+                attr = getattr(layer, attr_name)
+                if isinstance(attr, tf.keras.layers.Layer) and hasattr(attr, 'set_profiler'):
+                    attr.set_profiler(profiler)
+    
+    set_profiler_recursive(model)
+    print(f"🔧 모든 레이어에 프로파일러 설정 완료")
+
+
+# Whisper 학습 함수 (텐서 사이즈 측정 포함)
+def train_whisper_with_profiling(strategy, model_type="small", num_epochs=1, learning_rate=1e-4):
+    """Whisper 모델 학습 함수 (고급 텐서 사이즈 측정 포함)"""
+    
+    # 텐서 프로파일러 초기화
+    profiler = TensorProfiler(log_dir='/workspace/tensor_logs')
+    
+    try:
+        with strategy.scope():
+            # 모델 생성
+            model = create_whisper_model(model_type=model_type)
+            
+            # 모델에 프로파일러 설정
+            setup_model_profiling(model, profiler)
+            
+            # 옵티마이저 설정
+            optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
+            
+            # 메트릭 설정
+            metrics = [
+                tf.keras.metrics.SparseCategoricalAccuracy(name="accuracy"),
+                tf.keras.metrics.Mean(name="loss")
+            ]
+            
+            # 모델 컴파일
+            model.compile(optimizer=optimizer, metrics=metrics)
+        
+        # 데이터셋 생성
+        train_dataset = create_dummy_dataset(GLOBAL_BATCH_SIZE)
+        dist_dataset = strategy.experimental_distribute_dataset(train_dataset)
+        
+        # 체크포인트 설정
+        checkpoint_dir = '/workspace/checkpoints'
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        checkpoint = tf.train.Checkpoint(model=model, optimizer=optimizer)
+        
+        # 학습 루프
+        step = 0
+        iterator = iter(dist_dataset)
+        
+        # 시작 시간 기록
+        start_time = time.time()
+        
+        print(f"=== Tiresias 스타일 텐서 사이즈 측정을 포함한 Whisper-{model_type} 학습 시작 ===")
+        
+        # 첫 번째 스텝에서 모델 파라미터 로깅
+        profiler.start_step(step)
+        profiler.log_model_parameters(model)
+        profiler.end_step()
+        step += 1
+        
+        for epoch in range(num_epochs):
+            print(f"Epoch {epoch+1}/{num_epochs}")
+            
+            for batch_idx in range(MAX_ITERATIONS):
+                # 분산 데이터셋에서 배치 가져오기
+                try:
+                    inputs = next(iterator)
+                except StopIteration:
+                    iterator = iter(dist_dataset)
+                    inputs = next(iterator)
+                
+                # 현재 시간 기록
+                step_start = time.time()
+                
+                # 프로파일링 스텝 시작
+                profiler.start_step(step)
+                
+                # 분산 학습 스텝 실행 (텐서 사이즈 측정 포함)
+                loss = distributed_train_step(strategy, model, inputs, optimizer)
+                
+                # 메모리 사용량 로깅
+                memory_info = profiler.log_memory_usage()
+                
+                # 프로파일링 스텝 종료
+                step_tensor_size = profiler.end_step()
+                
+                # 스텝 완료 시간
+                step_end = time.time()
+                step_duration = step_end - step_start
+                elapsed = step_end - start_time
+                
+                # 매 10스텝마다 상세 로깅
+                if step % 10 == 0:
+                    print(f"📊 Step {step} - Loss: {loss.numpy():.4f}")
+                    print(f"   💾 GPU Memory: {memory_info['gpu_memory_mb']:.1f} MB, CPU Memory: {memory_info['cpu_memory_mb']:.1f} MB")
+                    print(f"   📏 TensorSize: {step_tensor_size:.2f} MB")
+                    print(f"   ⏱️  Time: {time.strftime('%H:%M:%S')} (경과: {elapsed:.1f}초, 스텝: {step_duration:.2f}초)")
+                else:
+                    print(f"Step {step}, Loss: {loss.numpy():.4f}, TensorSize: {step_tensor_size:.2f} MB")
+                
+                step += 1
+            
+            # 에포크 종료 후 체크포인트 저장
+            checkpoint.save(os.path.join(checkpoint_dir, f"whisper_{model_type}_epoch_{epoch+1}"))
+        
+        # 최종 결과 저장 및 출력
+        print("\n" + "="*60)
+        print("🔍 **Tiresias TensorSize 측정 완료**")
+        print("="*60)
+        
+        summary = profiler.save_final_results()
+        tiresias_tensorsize = summary['tiresias_tensorsize_mb']
+        
+        print(f"🔍 **Tiresias TensorSize 결과**")
+        print(f"whisper_{model_type}    {tiresias_tensorsize:.1f} MB")
+        print()
+        
+        # 기존 모델들과 비교표 출력
+        reference_models = {
+            'alexnet': 6.7,
+            'vgg16': 527.8,
+            'googlenet': 26.7,
+            'inception3': 90.9,
+            'resnet50': 97.5,
+            'resnet110': 6.6,
+            'resnet44': 2.5,
+            'resnet56': 3.3,
+            'densenet100_k12': 8.5,
+            'densenet40_k12': 1.3,
+            'bert': 1560,
+            'gpt2': 4000
+        }
+        
+        print("📊 **모델별 TensorSize 비교** (단위: MB)")
+        print("model\t\ttensorsizes")
+        for model_name, tensorsize in reference_models.items():
+            print(f"{model_name}\t\t{tensorsize}")
+        print(f"whisper_{model_type}\t{tiresias_tensorsize:.1f} ⬅️ **이번 측정값**")
+        print()
+        
+        # 카테고리 분석
+        if tiresias_tensorsize < 10:
+            category = "경량 모델"
+        elif tiresias_tensorsize < 100:
+            category = "중간 크기 모델"
+        elif tiresias_tensorsize < 1000:
+            category = "대형 모델"
+        else:
+            category = "초대형 모델"
+        
+        print("📈 **분석 결과:**")
+        print(f"- 카테고리: {category}")
+        
+        # 비슷한 크기의 모델 찾기
+        closest_models = []
+        for model_name, size in reference_models.items():
+            if abs(size - tiresias_tensorsize) < tiresias_tensorsize * 0.3:  # 30% 이내
+                closest_models.append((model_name, size))
+        
+        if closest_models:
+            closest_names = [name for name, _ in closest_models]
+            print(f"- 비교: {' ~ '.join(closest_names)} 수준")
+        
+        print(f"- 한 iteration당 처리하는 텐서 총 크기: {tiresias_tensorsize:.1f} MB")
+        print()
+        
+        print("💡 **TensorSize 의미:**")
+        print("- 한 번의 학습 iteration에서 처리되는 모든 텐서의 총 메모리 크기(MB)")
+        print("- GPU 메모리 요구량 예측과 작업 스케줄링 최적화에 사용")
+        print("- Tiresias 논문의 핵심 지표로 활용")
+        print("="*60)
+        
+        return model, summary
+        
+    finally:
+        # 프로파일러 종료
+        profiler.close()
 
 
 # 텐서 사이즈 로깅 함수
@@ -1087,132 +1607,6 @@ def create_whisper_model(model_type="small"):
     return WhisperForConditionalGeneration(config)
 
 
-# Whisper 학습 함수 (텐서 사이즈 측정 포함)
-def train_whisper(strategy, model_type="small", num_epochs=1, learning_rate=1e-4):
-    """Whisper 모델 학습 함수 (텐서 사이즈 측정 포함)"""
-    with strategy.scope():
-        # 모델 생성
-        model = create_whisper_model(model_type=model_type)
-        
-        # 옵티마이저 설정
-        optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
-        
-        # 메트릭 설정
-        metrics = [
-            tf.keras.metrics.SparseCategoricalAccuracy(name="accuracy"),
-            tf.keras.metrics.Mean(name="loss")
-        ]
-        
-        # 모델 컴파일
-        model.compile(optimizer=optimizer, metrics=metrics)
-    
-    # 데이터셋 생성
-    train_dataset = create_dummy_dataset(GLOBAL_BATCH_SIZE)
-    dist_dataset = strategy.experimental_distribute_dataset(train_dataset)
-    
-    # 체크포인트 설정
-    checkpoint_dir = '/workspace/checkpoints'
-    os.makedirs(checkpoint_dir, exist_ok=True)
-    checkpoint = tf.train.Checkpoint(model=model, optimizer=optimizer)
-    
-    # 텐서 사이즈 로그 디렉토리 설정
-    tensor_log_dir = '/workspace/tensor_logs'
-    os.makedirs(tensor_log_dir, exist_ok=True)
-    
-    # 텐서 사이즈 로그 헤더 작성
-    with open(os.path.join(tensor_log_dir, 'step_tensor_sizes.txt'), 'w') as f:
-        f.write("step,total_size_mb\n")
-    
-    # 학습 루프
-    step = 0
-    iterator = iter(dist_dataset)
-    
-    # 시작 시간 기록
-    start_time = time.time()
-    
-    print(f"=== 텐서 사이즈 측정을 포함한 Whisper-{model_type} 학습 시작 ===")
-    
-    for epoch in range(num_epochs):
-        print(f"Epoch {epoch+1}/{num_epochs}")
-        
-        for batch_idx in range(MAX_ITERATIONS):
-            # 분산 데이터셋에서 배치 가져오기
-            try:
-                inputs = next(iterator)
-            except StopIteration:
-                iterator = iter(dist_dataset)
-                inputs = next(iterator)
-            
-            # 현재 시간 기록
-            step_start = time.time()
-            
-            # 분산 학습 스텝 실행 (텐서 사이즈 측정 포함)
-            loss = distributed_train_step(strategy, model, inputs, optimizer)
-            
-            # 스텝 완료 시간
-            step_end = time.time()
-            step_duration = step_end - step_start
-            elapsed = step_end - start_time
-            
-            # 텐서 사이즈 로깅 (매 스텝마다)
-            log_tensor_sizes(step, tensor_log_dir)
-            
-            # 로깅
-            print(f"Step {step}, Loss: {loss.numpy():.4f}, Time: {time.strftime('%H:%M:%S')} (경과: {elapsed:.2f}초, 스텝 시간: {step_duration:.2f}초)")
-            
-            step += 1
-        
-        # 에포크 종료 후 체크포인트 저장
-        checkpoint.save(os.path.join(checkpoint_dir, f"whisper_{model_type}_epoch_{epoch+1}"))
-    
-    # 최종 텐서 사이즈 통계 저장
-    save_final_tensor_statistics(tensor_log_dir, step)
-    
-    return model
-
-
-def save_final_tensor_statistics(log_dir, total_steps):
-    """최종 텐서 사이즈 통계를 저장"""
-    try:
-        # 모든 스텝의 텐서 사이즈 읽기
-        step_sizes = []
-        with open(os.path.join(log_dir, 'step_tensor_sizes.txt'), 'r') as f:
-            lines = f.readlines()[1:]  # 헤더 제외
-            for line in lines:
-                step, size = line.strip().split(',')
-                step_sizes.append(float(size))
-        
-        if step_sizes:
-            avg_size = np.mean(step_sizes)
-            max_size = np.max(step_sizes)
-            min_size = np.min(step_sizes)
-            total_size = np.sum(step_sizes)
-            
-            statistics = {
-                'total_steps': total_steps,
-                'average_tensor_size_mb': avg_size,
-                'max_tensor_size_mb': max_size,
-                'min_tensor_size_mb': min_size,
-                'total_tensor_size_mb': total_size,
-                'step_sizes': step_sizes
-            }
-            
-            # 통계 저장
-            with open(os.path.join(log_dir, 'tensor_statistics.json'), 'w') as f:
-                json.dump(statistics, f, indent=2)
-            
-            print(f"\n=== 텐서 사이즈 통계 ===")
-            print(f"전체 스텝 수: {total_steps}")
-            print(f"평균 텐서 사이즈: {avg_size:.2f} MB")
-            print(f"최대 텐서 사이즈: {max_size:.2f} MB")
-            print(f"최소 텐서 사이즈: {min_size:.2f} MB")
-            print(f"총 텐서 사이즈: {total_size:.2f} MB")
-            print("=" * 30)
-            
-    except Exception as e:
-        print(f"텐서 통계 저장 중 오류 발생: {e}")
-
-
 # 추론 함수
 def transcribe_audio(model, audio_path, tokenizer=None, max_length=448):
     """
@@ -1243,7 +1637,7 @@ def transcribe_audio(model, audio_path, tokenizer=None, max_length=448):
 
 # 메인 함수
 def main(strategy):
-    print("Whisper-small 분산 학습 시작 (텐서 사이즈 측정 포함)...")
+    print("Whisper-small 분산 학습 시작 (Tiresias 스타일 텐서 사이즈 측정 포함)...")
     
     # 네트워크 및 GPU 모니터링 시작
     os.system('sh /workspace/network.sh &')  # network profile
@@ -1251,14 +1645,14 @@ def main(strategy):
     print('''
 ========================
 network profile started!
-tensor size monitoring enabled!
+Tiresias-style tensor size monitoring enabled!
 ========================''')
     
     # JCT 측정 시작
     start_time = time.time()
     
-    # 모델 학습 실행 (텐서 사이즈 측정 포함)
-    model = train_whisper(strategy, model_type="small")
+    # 모델 학습 실행 (Tiresias 스타일 텐서 사이즈 측정 포함)
+    model, tensor_summary = train_whisper_with_profiling(strategy, model_type="small")
     
     # JCT 측정 종료
     end_time = time.time()
@@ -1269,29 +1663,50 @@ tensor size monitoring enabled!
     print("jct:", jct)
     
     # JCT 파일 저장
-    model_txt = open('/workspace/model.txt', 'r')
-    save_dir_name = model_txt.read()
-    jct_file = open('/result/' + save_dir_name.strip() + '/' + task_type + '_' + str(task_index) + '_jct.txt', 'w')
-    jct_file.write('%.2f' % (float(jct)))
-    jct_file.close()
-    model_txt.close()
-    
-    # 텐서 사이즈 로그를 결과 디렉토리에 복사
-    tensor_log_source = '/workspace/tensor_logs'
-    tensor_log_dest = '/result/' + save_dir_name.strip() + '/tensor_logs'
-    
     try:
-        import shutil
-        if os.path.exists(tensor_log_source):
-            shutil.copytree(tensor_log_source, tensor_log_dest, dirs_exist_ok=True)
-            print(f"텐서 사이즈 로그가 {tensor_log_dest}에 저장되었습니다.")
+        model_txt = open('/workspace/model.txt', 'r')
+        save_dir_name = model_txt.read()
+        result_dir = '/result/' + save_dir_name.strip()
+        os.makedirs(result_dir, exist_ok=True)
+        
+        jct_file = open(result_dir + '/' + task_type + '_' + str(task_index) + '_jct.txt', 'w')
+        jct_file.write('%.2f' % (float(jct)))
+        jct_file.close()
+        model_txt.close()
+        
+        # 텐서 사이즈 로그를 결과 디렉토리에 복사
+        tensor_log_source = '/workspace/tensor_logs'
+        tensor_log_dest = result_dir + '/tensor_logs'
+        
+        try:
+            import shutil
+            if os.path.exists(tensor_log_source):
+                shutil.copytree(tensor_log_source, tensor_log_dest, dirs_exist_ok=True)
+                print(f"🔍 텐서 사이즈 로그가 {tensor_log_dest}에 저장되었습니다.")
+        except Exception as e:
+            print(f"텐서 로그 복사 중 오류 발생: {e}")
+        
+        # Tiresias 결과를 별도 파일에 저장
+        tiresias_result_file = result_dir + '/tiresias_tensorsize_result.txt'
+        with open(tiresias_result_file, 'w') as f:
+            f.write(f"model,tensorsize_mb\n")
+            f.write(f"whisper_small,{tensor_summary['tiresias_tensorsize_mb']:.1f}\n")
+        print(f"🔍 Tiresias 결과가 {tiresias_result_file}에 저장되었습니다.")
+        
     except Exception as e:
-        print(f"텐서 로그 복사 중 오류 발생: {e}")
+        print(f"결과 저장 중 오류 발생: {e}")
     
     # 모델 저장
     model_path = os.path.join(CACHE_DIR, "whisper_small_model")
-    model.save_weights(model_path)
-    print(f"모델이 {model_path}에 저장되었습니다.")
+    try:
+        model.save_weights(model_path)
+        print(f"모델이 {model_path}에 저장되었습니다.")
+    except Exception as e:
+        print(f"모델 저장 중 오류 발생: {e}")
+    
+    print("\n🎉 **Whisper 텐서 사이즈 측정 완료!**")
+    print(f"📊 최종 TensorSize: {tensor_summary['tiresias_tensorsize_mb']:.1f} MB")
+    print("🔍 상세 로그는 /workspace/tensor_logs 디렉토리에서 확인하세요.")
 
 
 if __name__ == "__main__":
