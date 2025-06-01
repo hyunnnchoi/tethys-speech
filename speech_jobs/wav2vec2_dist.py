@@ -1242,26 +1242,27 @@ def apply_feature_mask(hidden_states, mask_prob=0.05, mask_length=10):
 # 더미 오디오 데이터셋 생성 (수정됨 - from_generator 대신 range().map() 사용)
 def create_dummy_dataset(batch_size):
     """
-    형태가 일관된 더미 오디오 데이터셋 생성 - 메모리 절약을 위해 길이 단축
-    Thread 누수를 방지하기 위해 AUTOTUNE 사용을 제한
+    Thread 누수를 완전히 방지하는 더미 데이터셋 생성
     """
     audio_length = 32000  # 2초 * 16kHz
 
-    def generate_dummy_sample(_): # map 함수는 인자를 받으므로 _로 처리
+    def generate_dummy_sample(_):
         audio_features = tf.random.normal([audio_length], dtype=tf.float32)
         label = tf.constant(0.0, dtype=tf.float32)
         return audio_features, label
 
-    # 데이터셋 생성 (1000개의 더미 샘플 생성 - repeat 횟수를 줄이기 위해 증가)
-    dataset = tf.data.Dataset.range(1000) # 1000개의 인덱스 생성
-    # AUTOTUNE 대신 고정된 병렬 처리 수 사용 (Thread 누수 방지)
-    dataset = dataset.map(generate_dummy_sample, num_parallel_calls=4)
+    # 데이터셋 생성 - 매우 보수적인 설정
+    dataset = tf.data.Dataset.range(100)  # 더 작은 데이터셋
     
-    # 배치 처리 - drop_remainder=True로 일관된 배치 크기 보장
+    # Thread 사용 완전히 제한
+    dataset = dataset.map(generate_dummy_sample, num_parallel_calls=1)  # 병렬 처리 완전 제거
+    
+    # 배치 처리
     dataset = dataset.batch(batch_size, drop_remainder=True)
-    dataset = dataset.repeat() # 학습을 위해 반복
-    # prefetch도 고정 값 사용
-    dataset = dataset.prefetch(buffer_size=2)
+    dataset = dataset.repeat()  # 무한 반복
+    
+    # prefetch도 최소화
+    dataset = dataset.prefetch(buffer_size=1)  # 버퍼 크기 최소화
     
     return dataset
 
@@ -1331,100 +1332,57 @@ def create_full_model(model_type="pretraining",
         return Wav2Vec2Model(config)
 
 
-# 분산 학습 스텝 정의 (수정됨 - @tf.function 추가)
-@tf.function # 전체 함수를 tf.function으로 감쌈
+# 분산 학습 스텝 정의 (대폭 단순화하여 확실한 작동 보장)
+@tf.function 
 def distributed_train_step_tf_func(strategy, model, dist_inputs, optimizer):
-    """개선된 분산 학습 스텝 (tf.function으로 컴파일)"""
+    """간단하고 확실한 분산 학습 스텝"""
     
     def train_step(inputs):
-        features, labels = inputs # labels는 현재 더미 데이터에서 사용 안 함
-        batch_size = tf.shape(features)[0]
-
-        def empty_batch_fn():
-            return tf.constant(0.0, dtype=tf.float32)
+        features, labels = inputs
         
-        def normal_batch_fn():
-            with tf.GradientTape() as tape:
-                outputs = model(features, training=True)
-                loss = tf.constant(0.0, dtype=tf.float32) # 기본 손실값 초기화
-                
-                # 더 안전한 손실 계산 - isinstance 검사 없이
-                try:
-                    # outputs가 딕셔너리이고 필요한 키들이 있는지 확인
-                    if hasattr(outputs, 'get') and callable(getattr(outputs, 'get', None)):
-                        projected_states = outputs.get("projected_states")
-                        projected_quantized_features = outputs.get("projected_quantized_features")
-                        
-                        # None 체크 및 텐서 검증
-                        if (projected_states is not None and 
-                            projected_quantized_features is not None and
-                            hasattr(projected_states, 'shape') and 
-                            hasattr(projected_quantized_features, 'shape')):
-                            
-                            # 직접 손실 계산 (메서드 호출 대신)
-                            # 코사인 유사도 기반 contrastive loss 계산
-                            batch_size = tf.shape(projected_states)[0]
-                            sequence_length = tf.shape(projected_states)[1]
-                            hidden_size = tf.shape(projected_states)[2]
-                            
-                            # 정규화
-                            projected_states = tf.nn.l2_normalize(projected_states, axis=-1)
-                            projected_quantized_features = tf.nn.l2_normalize(projected_quantized_features, axis=-1)
-                            
-                            # 내적으로 유사도 계산
-                            positive_logits = tf.reduce_sum(projected_states * projected_quantized_features, axis=-1)
-                            
-                            # 간단한 contrastive loss (실제 구현보다 단순화)
-                            positive_logits = positive_logits / 0.1  # temperature
-                            contrastive_loss = -tf.reduce_mean(tf.nn.log_sigmoid(positive_logits))
-                            
-                            # diversity loss (간단한 버전)
-                            codevector_perplexity = outputs.get("codevector_perplexity", tf.constant(1.0))
-                            diversity_loss = tf.maximum(0.0, 320.0 - codevector_perplexity)
-                            
-                            loss = contrastive_loss + 0.1 * diversity_loss
-                        else:
-                            # 손실이 이미 계산된 경우 (다른 모델 타입)
-                            calculated_loss = outputs.get("loss")
-                            if calculated_loss is not None:
-                                loss = calculated_loss
-                    else:
-                        # outputs가 딕셔너리가 아닌 경우, 텐서인지 확인하고 기본 MSE 손실 사용
-                        if hasattr(outputs, 'shape'):
-                            # 단순한 reconstruction loss
-                            loss = tf.reduce_mean(tf.square(outputs))
-                        
-                except Exception:
-                    # 모든 오류 상황에서 기본값 사용
-                    loss = tf.constant(0.1, dtype=tf.float32)
-                
-                # NaN 체크 및 보정
-                loss = tf.where(tf.math.is_nan(loss), tf.constant(0.1, dtype=tf.float32), loss)
-                loss = tf.where(tf.math.is_inf(loss), tf.constant(0.1, dtype=tf.float32), loss)
-                scaled_loss = loss / tf.cast(strategy.num_replicas_in_sync, tf.float32)
+        with tf.GradientTape() as tape:
+            # 단순하게 모델 호출
+            outputs = model(features, training=True)
             
-            # 그래디언트 계산 및 적용
-            try:
-                gradients = tape.gradient(scaled_loss, model.trainable_variables)
-                # None gradients 필터링
-                trainable_vars = model.trainable_variables
-                filtered_gradients = []
-                for i, grad in enumerate(gradients):
-                    if grad is None:
-                        filtered_gradients.append(tf.zeros_like(trainable_vars[i]))
-                    else:
-                        filtered_gradients.append(grad)
+            # 기본 L2 손실 계산 (outputs의 모든 텐서 평균)
+            if isinstance(outputs, dict):
+                # 딕셔너리인 경우, 주요 출력들로 손실 계산
+                loss = tf.constant(0.0, dtype=tf.float32)
+                count = 0
                 
-                # 그래디언트 클리핑 및 적용
-                clipped_gradients, _ = tf.clip_by_global_norm(filtered_gradients, 1.0)
-                optimizer.apply_gradients(zip(clipped_gradients, trainable_vars))
-            except Exception:
-                # 그래디언트 계산 실패 시 아무것도 하지 않음
-                pass
-
-            return scaled_loss
+                for key, value in outputs.items():
+                    if value is not None and hasattr(value, 'dtype') and value.dtype == tf.float32:
+                        loss += tf.reduce_mean(tf.square(value))
+                        count += 1
+                
+                if count > 0:
+                    loss = loss / tf.cast(count, tf.float32)
+                else:
+                    loss = tf.constant(1.0, dtype=tf.float32)
+            else:
+                # 텐서인 경우 직접 손실 계산
+                loss = tf.reduce_mean(tf.square(outputs))
+            
+            # 스케일링
+            scaled_loss = loss / tf.cast(strategy.num_replicas_in_sync, tf.float32)
         
-        return tf.cond(tf.equal(batch_size, 0), empty_batch_fn, normal_batch_fn)
+        # 그래디언트 계산 및 적용
+        gradients = tape.gradient(scaled_loss, model.trainable_variables)
+        
+        # None gradients 처리
+        valid_gradients = []
+        valid_variables = []
+        for grad, var in zip(gradients, model.trainable_variables):
+            if grad is not None:
+                valid_gradients.append(grad)
+                valid_variables.append(var)
+        
+        if valid_gradients:
+            # 그래디언트 클리핑
+            clipped_gradients, _ = tf.clip_by_global_norm(valid_gradients, 1.0)
+            optimizer.apply_gradients(zip(clipped_gradients, valid_variables))
+        
+        return scaled_loss
     
     per_replica_losses = strategy.run(train_step, args=(dist_inputs,))
     return strategy.reduce(tf.distribute.ReduceOp.SUM, per_replica_losses, axis=None)
@@ -1458,9 +1416,12 @@ def train_wav2vec2(strategy, task_type, model_type="pretraining", model_size="sm
     train_dataset = create_dummy_dataset(GLOBAL_BATCH_SIZE)
     options = tf.data.Options()
     options.experimental_distribute.auto_shard_policy = tf.data.experimental.AutoShardPolicy.DATA
-    # Thread 누수 방지를 위한 추가 옵션
-    options.threading.private_threadpool_size = 4
-    options.threading.max_intra_op_parallelism = 2
+    # Thread 누수 완전 방지를 위한 최대한 엄격한 설정
+    options.threading.private_threadpool_size = 1  # 최소 Thread 수
+    options.threading.max_intra_op_parallelism = 1  # 완전히 직렬 처리
+    options.experimental_optimization.parallel_batch = False  # 병렬 배치 처리 비활성화
+    options.experimental_optimization.map_parallelization = False  # 맵 병렬화 비활성화
+    options.experimental_deterministic = True  # 결정적 처리
     train_dataset = train_dataset.with_options(options)
     dist_dataset = strategy.experimental_distribute_dataset(train_dataset)
     
