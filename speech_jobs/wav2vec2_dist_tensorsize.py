@@ -260,7 +260,7 @@ class TensorLoggingMixin:
     
     def log_tensor_if_profiler(self, tensor, name, tensor_type="activation"):
         """프로파일러가 있으면 텐서 로깅"""
-        if self.profiler:
+        if hasattr(self, 'profiler') and self.profiler:
             self.profiler.log_tensor_size(tensor, f"{self.name}_{name}", tensor_type)
 
 
@@ -383,6 +383,7 @@ def gelu(x):
 class GroupNormalization(tf.keras.layers.Layer, TensorLoggingMixin):
     def __init__(self, groups=32, axis=-1, epsilon=1e-5):
         super(GroupNormalization, self).__init__()
+        TensorLoggingMixin.__init__(self)
         self.groups = groups
         self.axis = axis
         self.epsilon = epsilon
@@ -447,6 +448,7 @@ class GroupNormalization(tf.keras.layers.Layer, TensorLoggingMixin):
 class RelativePositionalEncoding(tf.keras.layers.Layer, TensorLoggingMixin):
     def __init__(self, dim, max_length=5000):
         super(RelativePositionalEncoding, self).__init__()
+        TensorLoggingMixin.__init__(self)
         self.dim = dim
         pe = self._get_pos_encoding(max_length, dim)
         self.pos_embedding = tf.Variable(
@@ -478,6 +480,7 @@ class RelativePositionalEncoding(tf.keras.layers.Layer, TensorLoggingMixin):
 class Wav2Vec2FeatureExtractor(tf.keras.layers.Layer, TensorLoggingMixin):
     def __init__(self, config):
         super(Wav2Vec2FeatureExtractor, self).__init__()
+        TensorLoggingMixin.__init__(self)
         self.config = config
         
         # 컨볼루션 레이어 스택 생성
@@ -558,6 +561,7 @@ class Wav2Vec2FeatureExtractor(tf.keras.layers.Layer, TensorLoggingMixin):
 class Wav2Vec2MultiHeadAttention(tf.keras.layers.Layer, TensorLoggingMixin):
     def __init__(self, config):
         super(Wav2Vec2MultiHeadAttention, self).__init__()
+        TensorLoggingMixin.__init__(self)
         self.config = config
         self.embed_dim = config.hidden_size
         self.num_heads = config.num_attention_heads
