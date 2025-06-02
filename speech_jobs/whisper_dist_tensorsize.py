@@ -1349,12 +1349,25 @@ def setup_model_profiling(model, profiler):
             for sublayer in layer.layers:
                 set_profiler_recursive(sublayer)
         
+        # 안전한 속성 확인 - 문제가 될 수 있는 속성들은 제외
+        excluded_attrs = {
+            'input', 'output', 'input_shape', 'output_shape', 
+            'input_spec', 'output_spec', '_input_layers', '_output_layers',
+            '_inbound_nodes', '_outbound_nodes', 'built', '_built_input_shape'
+        }
+        
         # 모든 속성을 확인하여 레이어인 것들에 적용
         for attr_name in dir(layer):
-            if not attr_name.startswith('_'):
-                attr = getattr(layer, attr_name)
-                if isinstance(attr, tf.keras.layers.Layer) and hasattr(attr, 'set_profiler'):
-                    attr.set_profiler(profiler)
+            if (not attr_name.startswith('_') and 
+                attr_name not in excluded_attrs):
+                try:
+                    attr = getattr(layer, attr_name)
+                    if (isinstance(attr, tf.keras.layers.Layer) and 
+                        hasattr(attr, 'set_profiler')):
+                        attr.set_profiler(profiler)
+                except (AttributeError, ValueError, RuntimeError):
+                    # 레이어가 연결되지 않았거나 다른 이유로 접근할 수 없는 경우 무시
+                    continue
     
     set_profiler_recursive(model)
     print(f"🔧 모든 레이어에 프로파일러 설정 완료")
@@ -1371,6 +1384,17 @@ def train_whisper_with_profiling(strategy, model_type="small", num_epochs=1, lea
         with strategy.scope():
             # 모델 생성
             model = create_whisper_model(model_type=model_type)
+            
+            # 모델을 빌드하기 위해 더미 데이터로 한 번 호출
+            dummy_features = tf.random.normal((1, 80, 3000))  # [batch, n_mels, seq_len]
+            dummy_labels = tf.random.uniform((1, 100), minval=0, maxval=1000, dtype=tf.int32)
+            
+            try:
+                # 모델 빌드
+                _ = model(dummy_features, labels=dummy_labels, training=False)
+                print("🔧 모델 빌드 완료")
+            except Exception as e:
+                print(f"모델 빌드 중 오류 (무시하고 계속): {e}")
             
             # 모델에 프로파일러 설정
             setup_model_profiling(model, profiler)

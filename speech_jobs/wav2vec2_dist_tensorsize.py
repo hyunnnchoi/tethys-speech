@@ -98,26 +98,37 @@ class TensorProfiler:
         total_params = 0
         trainable_params = 0
         
-        for var in model.variables:
-            shape = var.shape.as_list()
-            param_count = np.prod(shape) if None not in shape else 0
-            param_size_mb = (param_count * var.dtype.size) / (1024 * 1024)
+        try:
+            # 모델이 빌드되었는지 확인
+            if not hasattr(model, '_built') or not model._built:
+                print("경고: 모델이 아직 빌드되지 않았습니다. 파라미터 로깅을 건너뜁니다.")
+                return 0, 0
             
-            total_params += param_count
-            if var.trainable:
-                trainable_params += param_count
+            for var in model.variables:
+                shape = var.shape.as_list()
+                param_count = np.prod(shape) if None not in shape else 0
+                param_size_mb = (param_count * var.dtype.size) / (1024 * 1024)
+                
+                total_params += param_count
+                if var.trainable:
+                    trainable_params += param_count
+                
+                self.parameter_sizes[var.name] = {
+                    'shape': shape,
+                    'count': param_count,
+                    'size_mb': param_size_mb,
+                    'trainable': var.trainable
+                }
+                
+                self.log_tensor_size(var, f"param_{var.name}", "parameter")
             
-            self.parameter_sizes[var.name] = {
-                'shape': shape,
-                'count': param_count,
-                'size_mb': param_size_mb,
-                'trainable': var.trainable
-            }
+            # 총 파라미터 정보 로깅
+            self.summary_log_file.write(f"Step {self.current_step}: Total params: {total_params:,}, Trainable: {trainable_params:,}\n")
             
-            self.log_tensor_size(var, f"param_{var.name}", "parameter")
-        
-        # 총 파라미터 정보 로깅
-        self.summary_log_file.write(f"Step {self.current_step}: Total params: {total_params:,}, Trainable: {trainable_params:,}\n")
+        except Exception as e:
+            print(f"모델 파라미터 로깅 중 오류 발생: {e}")
+            print("더미 파라미터 정보를 반환합니다.")
+            return 0, 0
         
         return total_params, trainable_params
     
@@ -1565,10 +1576,24 @@ def train_wav2vec2_with_profiling(strategy, model_type="pretraining", model_size
         # 모델 생성
         model = create_full_model(model_type=model_type, model_size=model_size)
         
+        # 모델 빌드를 위한 더미 입력 생성
+        dummy_input = tf.random.normal([1, 32000], dtype=tf.float32)  # 배치 크기 1, 오디오 길이 32000
+        
+        # 모델 빌드 (가중치 생성)
+        try:
+            _ = model(dummy_input, training=False)
+            print("모델이 성공적으로 빌드되었습니다.")
+        except Exception as e:
+            print(f"모델 빌드 중 오류 발생: {e}")
+            # 빌드 실패 시 더 작은 입력으로 재시도
+            dummy_input = tf.random.normal([1, 16000], dtype=tf.float32)
+            _ = model(dummy_input, training=False)
+            print("더 작은 입력으로 모델 빌드 완료.")
+        
         # 모델에 프로파일러 설정
         setup_model_profiling(model, profiler)
         
-        # 초기 모델 파라미터 로깅
+        # 모델이 빌드된 후 파라미터 로깅
         total_params, trainable_params = profiler.log_model_parameters(model)
         print(f"모델 파라미터: 총 {total_params:,}개, 학습 가능 {trainable_params:,}개")
         
