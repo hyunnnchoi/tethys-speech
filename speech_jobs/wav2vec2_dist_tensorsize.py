@@ -22,6 +22,7 @@ import argparse
 import psutil
 import threading
 from collections import defaultdict
+from scipy import stats  # skewness 계산을 위해 추가
 
 
 # ============ 텐서 사이즈 측정 클래스 ============ #
@@ -40,6 +41,10 @@ class TensorProfiler:
         self.activation_sizes = defaultdict(list)
         self.parameter_sizes = {}
         
+        # 새로 추가: skewness 정보 저장
+        self.tensor_skewness = defaultdict(list)
+        self.layer_skewness_summary = defaultdict(list)
+        
         # 스텝별 총 텐서 크기 추적 (Tiresias 스타일)
         self.step_total_tensor_sizes = []
         self.current_step_tensors = []
@@ -54,11 +59,158 @@ class TensorProfiler:
         self.summary_log_file = open(os.path.join(log_dir, 'summary.txt'), 'w')
         self.tiresias_log_file = open(os.path.join(log_dir, 'tiresias_tensorsize.txt'), 'w')
         
+        # 새로 추가: skewness 로그 파일
+        self.skewness_log_file = open(os.path.join(log_dir, 'tensor_skewness.txt'), 'w')
+        self.skewness_summary_file = open(os.path.join(log_dir, 'skewness_summary.txt'), 'w')
+        
         # 헤더 작성
         self.tensor_log_file.write("Step,Layer,Tensor_Type,Shape,Size_MB,Dtype\n")
         self.memory_log_file.write("Step,Time,GPU_Memory_MB,CPU_Memory_MB,CPU_Percent\n")
         self.tiresias_log_file.write("Step,Total_TensorSize_MB\n")
-        
+        self.skewness_log_file.write("Step,Layer,Tensor_Type,Shape,Skewness,Mean,Std,Min,Max\n")
+    
+    def calculate_tensor_skewness(self, tensor):
+        """텐서의 skewness(왜곡도) 계산"""
+        try:
+            # 텐서를 1D로 flatten
+            flat_tensor = tf.reshape(tensor, [-1])
+            
+            # 기본 통계량 계산
+            mean = tf.reduce_mean(flat_tensor)
+            variance = tf.reduce_mean(tf.square(flat_tensor - mean))
+            std = tf.sqrt(variance + 1e-8)  # 수치적 안정성을 위한 epsilon
+            
+            # skewness 계산: E[((X - μ) / σ)^3]
+            normalized = (flat_tensor - mean) / (std + 1e-8)
+            skewness = tf.reduce_mean(tf.pow(normalized, 3))
+            
+            # 추가 통계량
+            min_val = tf.reduce_min(flat_tensor)
+            max_val = tf.reduce_max(flat_tensor)
+            
+            return {
+                'skewness': float(skewness.numpy()),
+                'mean': float(mean.numpy()),
+                'std': float(std.numpy()),
+                'min': float(min_val.numpy()),
+                'max': float(max_val.numpy())
+            }
+        except Exception as e:
+            print(f"Skewness 계산 오류: {e}")
+            return {
+                'skewness': 0.0,
+                'mean': 0.0,
+                'std': 0.0,
+                'min': 0.0,
+                'max': 0.0
+            }
+    
+    def calculate_model_tensor_size_skewness(self):
+        """모델 텐서 크기들의 skewness(왜곡도) 계산 - Whisper와 동일한 방식"""
+        try:
+            # 모든 텐서 크기들 수집
+            all_tensor_sizes = []
+            
+            for tensor_name, size_data_list in self.tensor_sizes.items():
+                for size_data in size_data_list:
+                    if size_data['size_mb'] > 0:  # 0보다 큰 텐서만 포함
+                        all_tensor_sizes.append(size_data['size_mb'])
+            
+            if len(all_tensor_sizes) < 3:  # skewness 계산을 위해 최소 3개 데이터 필요
+                return 0.0
+            
+            # skewness 계산 (scipy.stats.skew 사용 - Whisper와 동일)
+            tensor_skewness = stats.skew(all_tensor_sizes)
+            
+            return float(tensor_skewness)
+            
+        except Exception as e:
+            print(f"Model tensor size skewness 계산 오류: {e}")
+            return 0.0
+    
+    def calculate_operation_skewness(self):
+        """Operation별 텐서 크기들의 skewness 계산"""
+        try:
+            operation_skewness = {}
+            
+            for tensor_name, size_data_list in self.tensor_sizes.items():
+                sizes_mb = [data['size_mb'] for data in size_data_list if data['size_mb'] > 0]
+                
+                if len(sizes_mb) >= 3:  # 최소 3개 데이터 포인트 필요
+                    op_skewness = stats.skew(sizes_mb)
+                    operation_skewness[tensor_name] = float(op_skewness)
+            
+            return operation_skewness
+            
+        except Exception as e:
+            print(f"Operation skewness 계산 오류: {e}")
+            return {}
+    
+    def calculate_layer_type_skewness(self):
+        """레이어 타입별 텐서 크기들의 skewness 계산"""
+        try:
+            # 텐서 타입별로 그룹화
+            type_sizes = {}
+            
+            for tensor_name, size_data_list in self.tensor_sizes.items():
+                for size_data in size_data_list:
+                    tensor_type = size_data['type']
+                    size_mb = size_data['size_mb']
+                    
+                    if tensor_type not in type_sizes:
+                        type_sizes[tensor_type] = []
+                    
+                    if size_mb > 0:
+                        type_sizes[tensor_type].append(size_mb)
+            
+            # 각 타입별 skewness 계산
+            type_skewness = {}
+            for tensor_type, sizes in type_sizes.items():
+                if len(sizes) >= 3:
+                    type_skewness[tensor_type] = float(stats.skew(sizes))
+            
+            return type_skewness
+            
+        except Exception as e:
+            print(f"Layer type skewness 계산 오류: {e}")
+            return {}
+    
+    def get_skewness_summary(self):
+        """전체 skewness 분석 요약 - Whisper와 동일한 방식"""
+        try:
+            # 전체 모델 skewness
+            model_skewness = self.calculate_model_tensor_size_skewness()
+            
+            # Operation별 skewness
+            operation_skewness = self.calculate_operation_skewness()
+            
+            # 레이어 타입별 skewness
+            layer_type_skewness = self.calculate_layer_type_skewness()
+            
+            # 통계 정보
+            all_tensor_sizes = []
+            for tensor_name, size_data_list in self.tensor_sizes.items():
+                for size_data in size_data_list:
+                    if size_data['size_mb'] > 0:
+                        all_tensor_sizes.append(size_data['size_mb'])
+            
+            skewness_summary = {
+                'model_skewness': model_skewness,
+                'operation_skewness': operation_skewness,
+                'layer_type_skewness': layer_type_skewness,
+                'tensor_count': len(all_tensor_sizes),
+                'mean_tensor_size_mb': np.mean(all_tensor_sizes) if all_tensor_sizes else 0,
+                'std_tensor_size_mb': np.std(all_tensor_sizes) if all_tensor_sizes else 0,
+                'min_tensor_size_mb': np.min(all_tensor_sizes) if all_tensor_sizes else 0,
+                'max_tensor_size_mb': np.max(all_tensor_sizes) if all_tensor_sizes else 0
+            }
+            
+            return skewness_summary
+            
+        except Exception as e:
+            print(f"Skewness 요약 계산 오류: {e}")
+            return {'model_skewness': 0.0}
+    
     def log_tensor_size(self, tensor, name, tensor_type="activation"):
         """개별 텐서 크기 로깅"""
         if tensor is None:
@@ -86,6 +238,87 @@ class TensorProfiler:
             
         except Exception as e:
             print(f"텐서 크기 로깅 오류 {name}: {e}")
+    
+    def get_layer_skewness_summary(self):
+        """레이어별 skewness 요약 통계 계산"""
+        layer_summary = {}
+        
+        for tensor_name, skew_data in self.tensor_skewness.items():
+            # 레이어 이름 추출 (첫 번째 '_' 이전 부분)
+            layer_name = tensor_name.split('_')[0] if '_' in tensor_name else tensor_name
+            
+            if layer_name not in layer_summary:
+                layer_summary[layer_name] = {
+                    'skewness_values': [],
+                    'tensor_types': set(),
+                    'count': 0
+                }
+            
+            # 마지막 몇 스텝의 안정된 값들만 사용
+            stable_data = skew_data[-3:] if len(skew_data) >= 3 else skew_data
+            
+            for data in stable_data:
+                layer_summary[layer_name]['skewness_values'].append(data['skewness'])
+                layer_summary[layer_name]['tensor_types'].add(data['type'])
+                layer_summary[layer_name]['count'] += 1
+        
+        # 각 레이어의 평균 skewness 계산
+        final_summary = {}
+        for layer_name, data in layer_summary.items():
+            if data['skewness_values']:
+                avg_skewness = np.mean(data['skewness_values'])
+                std_skewness = np.std(data['skewness_values'])
+                
+                final_summary[layer_name] = {
+                    'avg_skewness': avg_skewness,
+                    'std_skewness': std_skewness,
+                    'tensor_types': list(data['tensor_types']),
+                    'sample_count': data['count']
+                }
+        
+        return final_summary
+    
+    def get_model_skewness_profile(self):
+        """전체 모델의 skewness 프로파일 생성"""
+        layer_summary = self.get_layer_skewness_summary()
+        
+        # 레이어 타입별 skewness 분류
+        activation_skewness = []
+        parameter_skewness = []
+        gradient_skewness = []
+        
+        for layer_name, data in layer_summary.items():
+            avg_skew = data['avg_skewness']
+            
+            if 'activation' in data['tensor_types']:
+                activation_skewness.append(avg_skew)
+            if 'parameter' in data['tensor_types']:
+                parameter_skewness.append(avg_skew)
+            if 'gradient' in data['tensor_types']:
+                gradient_skewness.append(avg_skew)
+        
+        profile = {
+            'layer_summary': layer_summary,
+            'overall_stats': {
+                'activation_skewness': {
+                    'mean': np.mean(activation_skewness) if activation_skewness else 0.0,
+                    'std': np.std(activation_skewness) if activation_skewness else 0.0,
+                    'count': len(activation_skewness)
+                },
+                'parameter_skewness': {
+                    'mean': np.mean(parameter_skewness) if parameter_skewness else 0.0,
+                    'std': np.std(parameter_skewness) if parameter_skewness else 0.0,
+                    'count': len(parameter_skewness)
+                },
+                'gradient_skewness': {
+                    'mean': np.mean(gradient_skewness) if gradient_skewness else 0.0,
+                    'std': np.std(gradient_skewness) if gradient_skewness else 0.0,
+                    'count': len(gradient_skewness)
+                }
+            }
+        }
+        
+        return profile
     
     def log_gradients(self, gradients, variables):
         """그래디언트 텐서 크기 로깅"""
@@ -191,6 +424,7 @@ class TensorProfiler:
         self.memory_log_file.flush()
         self.summary_log_file.flush()
         self.tiresias_log_file.flush()
+        self.skewness_log_file.flush()
     
     def get_tiresias_tensorsize(self):
         """Tiresias 스타일 총 텐서 크기 계산"""
@@ -207,8 +441,9 @@ class TensorProfiler:
             return np.mean(self.step_total_tensor_sizes) if self.step_total_tensor_sizes else 0.0
     
     def get_summary(self):
-        """요약 정보 생성"""
+        """요약 정보 생성 (skewness 정보 포함)"""
         tiresias_tensorsize = self.get_tiresias_tensorsize()
+        skewness_summary = self.get_skewness_summary()
         
         summary = {
             'total_steps': self.current_step,
@@ -216,7 +451,9 @@ class TensorProfiler:
             'avg_memory_usage': np.mean([m['gpu_memory_mb'] for m in self.memory_usage]) if self.memory_usage else 0,
             'peak_memory_usage': max([m['gpu_memory_mb'] for m in self.memory_usage]) if self.memory_usage else 0,
             'tiresias_tensorsize': tiresias_tensorsize,
-            'step_tensor_sizes': self.step_total_tensor_sizes
+            'step_tensor_sizes': self.step_total_tensor_sizes,
+            'model_skewness': skewness_summary['model_skewness'],  # Whisper와 동일
+            'skewness_analysis': skewness_summary  # Whisper와 동일
         }
         
         # 요약 정보를 파일에 저장
@@ -225,12 +462,57 @@ class TensorProfiler:
         self.summary_log_file.write(f"평균 GPU 메모리 사용량: {summary['avg_memory_usage']:.2f} MB\n")
         self.summary_log_file.write(f"최대 GPU 메모리 사용량: {summary['peak_memory_usage']:.2f} MB\n")
         self.summary_log_file.write(f"Tiresias TensorSize: {tiresias_tensorsize:.2f} MB\n")
+        self.summary_log_file.write(f"Model Skewness: {skewness_summary['model_skewness']:.4f}\n")
+        
+        # Skewness 요약 정보 저장
+        self.summary_log_file.write(f"\n=== Skewness 분석 결과 ===\n")
+        self.summary_log_file.write(f"Model Tensor Size Skewness: {skewness_summary['model_skewness']:.4f}\n")
+        self.summary_log_file.write(f"Total Tensor Count: {skewness_summary['tensor_count']}\n")
+        self.summary_log_file.write(f"Mean Tensor Size: {skewness_summary['mean_tensor_size_mb']:.4f} MB\n")
+        self.summary_log_file.write(f"Std Tensor Size: {skewness_summary['std_tensor_size_mb']:.4f} MB\n")
+        
+        # 레이어 타입별 skewness 상세 정보 저장
+        self.skewness_summary_file.write("Layer_Type,Skewness\n")
+        for layer_type, skewness in skewness_summary['layer_type_skewness'].items():
+            self.skewness_summary_file.write(f"{layer_type},{skewness:.6f}\n")
+        
+        # Operation별 상위 10개 skewness 저장
+        op_skewness = skewness_summary['operation_skewness']
+        sorted_ops = sorted(op_skewness.items(), key=lambda x: abs(x[1]), reverse=True)[:10]
+        
+        self.skewness_summary_file.write("\nOperation,Skewness\n")
+        for op_name, skewness in sorted_ops:
+            self.skewness_summary_file.write(f"{op_name},{skewness:.6f}\n")
         
         # Tiresias 스타일 결과 파일 생성
         tiresias_result_file = open(os.path.join(self.log_dir, 'tiresias_result.txt'), 'w')
         tiresias_result_file.write("model\ttensorsizes\n")
         tiresias_result_file.write(f"wav2vec2\t{tiresias_tensorsize:.1f}\n")
         tiresias_result_file.close()
+        
+        # 레거시 포맷으로 skewness 결과 저장 (Whisper와 동일한 형식)
+        skewness_result_file = open(os.path.join(self.log_dir, 'legacy_skewness_result.txt'), 'w')
+        skewness_result_file.write("model,skewness\n")
+        skewness_result_file.write(f"wav2vec2,{skewness_summary['model_skewness']:.1f}\n")
+        skewness_result_file.close()
+        
+        # 통합 결과 파일 저장 (Whisper와 동일한 형식)
+        combined_result_file = open(os.path.join(self.log_dir, 'combined_metrics_result.txt'), 'w')
+        combined_result_file.write("model,tensorsize_mb,skewness\n")
+        combined_result_file.write(f"wav2vec2,{tiresias_tensorsize:.1f},{skewness_summary['model_skewness']:.1f}\n")
+        combined_result_file.close()
+        
+        # Tiresias + Skewness JSON 결과 저장
+        final_result = {
+            'model': 'wav2vec2',
+            'tensorsize_mb': tiresias_tensorsize,
+            'skewness': skewness_summary['model_skewness'],
+            'total_steps': summary['total_steps'],
+            'measurement_method': 'Tiresias_style'
+        }
+        
+        with open(os.path.join(self.log_dir, 'final_summary.json'), 'w') as f:
+            json.dump(final_result, f, indent=2)
         
         return summary
     
@@ -242,6 +524,8 @@ class TensorProfiler:
         self.memory_log_file.close()
         self.summary_log_file.close()
         self.tiresias_log_file.close()
+        self.skewness_log_file.close()
+        self.skewness_summary_file.close()
         
         return summary
 
@@ -1813,11 +2097,18 @@ tensor profiling enabled!
     
     # Tiresias 스타일 TensorSize 결과 출력
     tiresias_tensorsize = profiling_summary['tiresias_tensorsize']
+    model_skewness = profiling_summary['model_skewness']  # 새로 추가
+    
     print(f"\n🔍 **Tiresias TensorSize 결과**")
     print(f"wav2vec2_{model_size}\t{tiresias_tensorsize:.1f} MB")
+    print()
+    
+    print(f"📊 **모델 Skewness 결과**")
+    print(f"wav2vec2_{model_size}\t{model_skewness:.1f}")
+    print()
     
     # 다른 모델들과의 비교표 출력
-    print(f"\n📊 **모델별 TensorSize 비교** (단위: MB)")
+    print(f"📊 **모델별 TensorSize 비교** (단위: MB)")
     print("=" * 50)
     print("model\t\ttensorsizes")
     print("-" * 50)
@@ -1847,6 +2138,40 @@ tensor profiling enabled!
     print(f"wav2vec2_{model_size}\t\t{tiresias_tensorsize:.1f} ⬅️ **이번 측정값**")
     print("=" * 50)
     
+    # Skewness 비교표도 출력 (기존 데이터가 있다면)
+    print(f"\n📊 **모델별 Skewness 비교**")
+    print("=" * 50)
+    print("model\t\tskewness")
+    print("-" * 50)
+    
+    # 제공된 레거시 skewness 데이터
+    reference_skewness = [
+        ("alexnet", 2.6),
+        ("vgg16", 5.1),
+        ("googlenet", 4.2),
+        ("inception3", 4.2),
+        ("resnet50", 3.8),
+        ("resnet110", 2.3),
+        ("resnet44", 2.4),
+        ("resnet56", 2.3),
+        ("densenet100", 1.9),
+        ("densenet40", 1.9),
+        ("vit", 7.3),
+        ("bert", 7.2),
+        ("gpt1m", 8),
+        ("gpt2m", 9.6),
+        ("gpt2l", 8)
+    ]
+    
+    # 참조 모델들 출력
+    for model_name, skew in reference_skewness:
+        print(f"{model_name}\t\t{skew}")
+    
+    # 현재 모델 결과 강조 출력
+    print("-" * 50)
+    print(f"wav2vec2_{model_size}\t\t{weighted_avg_skewness:.2f} ⬅️ **이번 측정값**")
+    print("=" * 50)
+    
     # 분석 코멘트
     if tiresias_tensorsize < 10:
         size_category = "경량 모델"
@@ -1861,10 +2186,29 @@ tensor profiling enabled!
         size_category = "초대형 모델"
         comparison = "BERT/GPT 수준"
     
-    print(f"\n📈 **분석 결과:**")
-    print(f"- 카테고리: {size_category}")
-    print(f"- 비교: {comparison}")
-    print(f"- 한 iteration당 처리하는 텐서 총 크기: {tiresias_tensorsize:.1f} MB")
+    # Skewness 카테고리 분석
+    if weighted_avg_skewness < 3:
+        skew_category = "낮은 왜곡도"
+        skew_comparison = "DenseNet 계열과 비슷"
+    elif weighted_avg_skewness < 5:
+        skew_category = "중간 왜곡도"
+        skew_comparison = "ResNet/Inception 계열과 비슷"
+    elif weighted_avg_skewness < 8:
+        skew_category = "높은 왜곡도"
+        skew_comparison = "VGG/Transformer 계열과 비슷"
+    else:
+        skew_category = "매우 높은 왜곡도"
+        skew_comparison = "GPT 계열과 비슷"
+    
+    print(f"\n📈 **종합 분석 결과:**")
+    print(f"🔹 TensorSize")
+    print(f"  - 카테고리: {size_category}")
+    print(f"  - 비교: {comparison}")
+    print(f"  - 한 iteration당 처리하는 텐서 총 크기: {tiresias_tensorsize:.1f} MB")
+    print(f"🔹 Skewness")
+    print(f"  - 카테고리: {skew_category}")
+    print(f"  - 비교: {skew_comparison}")
+    print(f"  - 텐서 분포 왜곡도: {weighted_avg_skewness:.2f}")
     
     # JCT 파일 저장
     try:
@@ -1883,6 +2227,7 @@ tensor profiling enabled!
         tensor_summary_file.write(f"Average GPU Memory (MB): {profiling_summary['avg_memory_usage']:.2f}\n")
         tensor_summary_file.write(f"Peak GPU Memory (MB): {profiling_summary['peak_memory_usage']:.2f}\n")
         tensor_summary_file.write(f"Tiresias TensorSize (MB): {tiresias_tensorsize:.2f}\n")
+        tensor_summary_file.write(f"Model Skewness: {model_skewness:.4f}\n")
         tensor_summary_file.write(f"JCT (seconds): {jct:.2f}\n")
         tensor_summary_file.close()
         
@@ -1892,12 +2237,26 @@ tensor profiling enabled!
         tiresias_result_file.write(f"wav2vec2_{model_size}\t{tiresias_tensorsize:.1f}\n")
         tiresias_result_file.close()
         
+        # Skewness 결과 파일 저장 (레거시 포맷)
+        skewness_result_file = open('/result/' + save_dir_name.strip() + '/' + task_type + '_' + str(task_index) + '_skewness.txt', 'w')
+        skewness_result_file.write("model,skewness\n")
+        skewness_result_file.write(f"wav2vec2_{model_size},{model_skewness:.1f}\n")
+        skewness_result_file.close()
+        
+        # 통합 결과 파일 저장 (Whisper와 동일한 형식)
+        combined_result_file = open('/result/' + save_dir_name.strip() + '/' + task_type + '_' + str(task_index) + '_combined.txt', 'w')
+        combined_result_file.write("model,tensorsize_mb,skewness\n")
+        combined_result_file.write(f"wav2vec2_{model_size},{tiresias_tensorsize:.1f},{model_skewness:.1f}\n")
+        combined_result_file.close()
+        
         model_txt.close()
         
         print(f"\n💾 **결과 파일 저장 완료:**")
         print(f"- JCT: /result/{save_dir_name.strip()}/{task_type}_{task_index}_jct.txt")
         print(f"- 텐서 요약: /result/{save_dir_name.strip()}/{task_type}_{task_index}_tensor_summary.txt")
         print(f"- Tiresias 결과: /result/{save_dir_name.strip()}/{task_type}_{task_index}_tiresias.txt")
+        print(f"- Skewness 결과: /result/{save_dir_name.strip()}/{task_type}_{task_index}_skewness.txt")
+        print(f"- 통합 결과: /result/{save_dir_name.strip()}/{task_type}_{task_index}_combined.txt")
         
     except Exception as e:
         print(f"결과 파일 저장 중 오류: {e}")
